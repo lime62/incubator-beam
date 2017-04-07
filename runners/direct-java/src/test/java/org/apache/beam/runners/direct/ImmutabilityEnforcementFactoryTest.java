@@ -24,7 +24,7 @@ import org.apache.beam.sdk.testing.TestPipeline;
 import org.apache.beam.sdk.transforms.AppliedPTransform;
 import org.apache.beam.sdk.transforms.Count;
 import org.apache.beam.sdk.transforms.Create;
-import org.apache.beam.sdk.transforms.OldDoFn;
+import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.util.IllegalMutationException;
 import org.apache.beam.sdk.util.WindowedValue;
@@ -42,6 +42,8 @@ import org.junit.runners.JUnit4;
  */
 @RunWith(JUnit4.class)
 public class ImmutabilityEnforcementFactoryTest implements Serializable {
+  @Rule public transient TestPipeline p =
+      TestPipeline.create().enableAbandonedNodeEnforcement(false);
   @Rule public transient ExpectedException thrown = ExpectedException.none();
   private transient ImmutabilityEnforcementFactory factory;
   private transient BundleFactory bundleFactory;
@@ -52,19 +54,18 @@ public class ImmutabilityEnforcementFactoryTest implements Serializable {
   public void setup() {
     factory = new ImmutabilityEnforcementFactory();
     bundleFactory = ImmutableListBundleFactory.create();
-    TestPipeline p = TestPipeline.create();
     pcollection =
         p.apply(Create.of("foo".getBytes(), "spamhameggs".getBytes()))
             .apply(
                 ParDo.of(
-                    new OldDoFn<byte[], byte[]>() {
-                      @Override
-                      public void processElement(OldDoFn<byte[], byte[]>.ProcessContext c)
+                    new DoFn<byte[], byte[]>() {
+                      @ProcessElement
+                      public void processElement(ProcessContext c)
                           throws Exception {
                         c.element()[0] = 'b';
                       }
                     }));
-    consumer = pcollection.apply(Count.<byte[]>globally()).getProducingTransformInternal();
+    consumer = DirectGraphs.getProducer(pcollection.apply(Count.<byte[]>globally()));
   }
 
   @Test
@@ -78,7 +79,7 @@ public class ImmutabilityEnforcementFactoryTest implements Serializable {
     enforcement.afterElement(element);
     enforcement.afterFinish(
         elements,
-        StepTransformResult.withoutHold(consumer).build(),
+        StepTransformResult.<byte[]>withoutHold(consumer).build(),
         Collections.<CommittedBundle<?>>emptyList());
   }
 
@@ -98,7 +99,7 @@ public class ImmutabilityEnforcementFactoryTest implements Serializable {
     enforcement.afterElement(element);
     enforcement.afterFinish(
         elements,
-        StepTransformResult.withoutHold(consumer).build(),
+        StepTransformResult.<byte[]>withoutHold(consumer).build(),
         Collections.<CommittedBundle<?>>emptyList());
   }
 
@@ -120,7 +121,7 @@ public class ImmutabilityEnforcementFactoryTest implements Serializable {
     thrown.expectMessage("Input values must not be mutated");
     enforcement.afterFinish(
         elements,
-        StepTransformResult.withoutHold(consumer).build(),
+        StepTransformResult.<byte[]>withoutHold(consumer).build(),
         Collections.<CommittedBundle<?>>emptyList());
   }
 }

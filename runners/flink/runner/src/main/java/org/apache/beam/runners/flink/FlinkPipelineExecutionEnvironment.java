@@ -20,11 +20,6 @@ package org.apache.beam.runners.flink;
 import static com.google.common.base.Preconditions.checkNotNull;
 
 import java.util.List;
-import org.apache.beam.runners.flink.translation.FlinkBatchPipelineTranslator;
-import org.apache.beam.runners.flink.translation.FlinkPipelineTranslator;
-import org.apache.beam.runners.flink.translation.FlinkStreamingPipelineTranslator;
-import org.apache.beam.runners.flink.translation.PipelineTranslationOptimizer;
-import org.apache.beam.runners.flink.translation.TranslationMode;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.flink.api.common.JobExecutionResult;
 import org.apache.flink.api.java.CollectionEnvironment;
@@ -43,7 +38,7 @@ import org.slf4j.LoggerFactory;
  * ({@link FlinkBatchPipelineTranslator} or {@link FlinkStreamingPipelineTranslator}) to
  * transform the Beam job into a Flink one, and executes the (translated) job.
  */
-public class FlinkPipelineExecutionEnvironment {
+class FlinkPipelineExecutionEnvironment {
 
   private static final Logger LOG =
       LoggerFactory.getLogger(FlinkPipelineExecutionEnvironment.class);
@@ -84,7 +79,7 @@ public class FlinkPipelineExecutionEnvironment {
    * a {@link org.apache.flink.api.java.DataSet}
    * or {@link org.apache.flink.streaming.api.datastream.DataStream} one.
    * */
-  public void translate(Pipeline pipeline) {
+  public void translate(FlinkRunner flinkRunner, Pipeline pipeline) {
     this.flinkBatchEnv = null;
     this.flinkStreamEnv = null;
 
@@ -97,7 +92,7 @@ public class FlinkPipelineExecutionEnvironment {
     FlinkPipelineTranslator translator;
     if (translationMode == TranslationMode.STREAMING) {
       this.flinkStreamEnv = createStreamExecutionEnvironment();
-      translator = new FlinkStreamingPipelineTranslator(flinkStreamEnv, options);
+      translator = new FlinkStreamingPipelineTranslator(flinkRunner, flinkStreamEnv, options);
     } else {
       this.flinkBatchEnv = createBatchExecutionEnvironment();
       translator = new FlinkBatchPipelineTranslator(flinkBatchEnv, options);
@@ -159,6 +154,12 @@ public class FlinkPipelineExecutionEnvironment {
     // set parallelism in the options (required by some execution code)
     options.setParallelism(flinkBatchEnv.getParallelism());
 
+    if (options.getObjectReuse()) {
+      flinkBatchEnv.getConfig().enableObjectReuse();
+    } else {
+      flinkBatchEnv.getConfig().disableObjectReuse();
+    }
+
     return flinkBatchEnv;
   }
 
@@ -196,6 +197,12 @@ public class FlinkPipelineExecutionEnvironment {
 
     // set parallelism in the options (required by some execution code)
     options.setParallelism(flinkStreamEnv.getParallelism());
+
+    if (options.getObjectReuse()) {
+      flinkStreamEnv.getConfig().enableObjectReuse();
+    } else {
+      flinkStreamEnv.getConfig().disableObjectReuse();
+    }
 
     // default to event time
     flinkStreamEnv.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);

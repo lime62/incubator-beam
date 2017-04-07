@@ -38,12 +38,12 @@ import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.options.Validation;
 import org.apache.beam.sdk.transforms.Count;
+import org.apache.beam.sdk.transforms.Distinct;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.Flatten;
 import org.apache.beam.sdk.transforms.Keys;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
-import org.apache.beam.sdk.transforms.RemoveDuplicates;
 import org.apache.beam.sdk.transforms.Values;
 import org.apache.beam.sdk.transforms.View;
 import org.apache.beam.sdk.transforms.WithKeys;
@@ -65,9 +65,9 @@ import org.slf4j.LoggerFactory;
 /**
  * An example that computes a basic TF-IDF search table for a directory or GCS prefix.
  *
- * <p> Concepts: joining data; side inputs; logging
+ * <p>Concepts: joining data; side inputs; logging
  *
- * <p> To execute this pipeline locally, specify general pipeline configuration:
+ * <p>To execute this pipeline locally, specify general pipeline configuration:
  * <pre>{@code
  *   --project=YOUR_PROJECT_ID
  * }</pre>
@@ -76,7 +76,7 @@ import org.slf4j.LoggerFactory;
  *   --output=[YOUR_LOCAL_FILE | gs://YOUR_OUTPUT_PREFIX]
  * }</pre>
  *
- * <p> To execute this pipeline using the Dataflow service, specify pipeline configuration:
+ * <p>To execute this pipeline using the Dataflow service, specify pipeline configuration:
  * <pre>{@code
  *   --project=YOUR_PROJECT_ID
  *   --stagingLocation=gs://YOUR_STAGING_DIRECTORY
@@ -85,14 +85,14 @@ import org.slf4j.LoggerFactory;
  *   --output=gs://YOUR_OUTPUT_PREFIX
  * }</pre>
  *
- * <p> The default input is {@code gs://dataflow-samples/shakespeare/} and can be overridden with
+ * <p>The default input is {@code gs://dataflow-samples/shakespeare/} and can be overridden with
  * {@code --input}.
  */
 public class TFIDF {
   /**
    * Options supported by {@link TFIDF}.
-   * <p>
-   * Inherits standard configuration options.
+   *
+   * <p>Inherits standard configuration options.
    */
   private interface Options extends PipelineOptions, FlinkPipelineOptions {
     @Description("Path to the directory or GCS prefix containing files to read from")
@@ -129,7 +129,12 @@ public class TFIDF {
     Set<URI> uris = new HashSet<>();
     if (absoluteUri.getScheme().equals("file")) {
       File directory = new File(absoluteUri);
-      for (String entry : directory.list()) {
+      String[] directoryListing = directory.list();
+      if (directoryListing == null) {
+        throw new IOException(
+            "Directory " + absoluteUri + " is not a valid path or IO Error occurred.");
+      }
+      for (String entry : directoryListing) {
         File path = new File(directory, entry);
         uris.add(path.toURI());
       }
@@ -157,7 +162,9 @@ public class TFIDF {
       extends PTransform<PBegin, PCollection<KV<URI, String>>> {
     private static final long serialVersionUID = 0;
 
-    private Iterable<URI> uris;
+    // transient because PTransform is not really meant to be serialized.
+    // see note on PTransform
+    private final transient Iterable<URI> uris;
 
     public ReadDocuments(Iterable<URI> uris) {
       this.uris = uris;
@@ -169,7 +176,7 @@ public class TFIDF {
     }
 
     @Override
-    public PCollection<KV<URI, String>> apply(PBegin input) {
+    public PCollection<KV<URI, String>> expand(PBegin input) {
       Pipeline pipeline = input.getPipeline();
 
       // Create one TextIO.Read transform for each document
@@ -212,7 +219,7 @@ public class TFIDF {
     public ComputeTfIdf() { }
 
     @Override
-    public PCollection<KV<String, KV<URI, Double>>> apply(
+    public PCollection<KV<String, KV<URI, Double>>> expand(
         PCollection<KV<URI, String>> uriToContent) {
 
       // Compute the total number of documents, and
@@ -221,7 +228,7 @@ public class TFIDF {
       final PCollectionView<Long> totalDocuments =
           uriToContent
               .apply("GetURIs", Keys.<URI>create())
-              .apply("RemoveDuplicateDocs", RemoveDuplicates.<URI>create())
+              .apply("DistinctDocs", Distinct.<URI>create())
               .apply(Count.<URI>globally())
               .apply(View.<Long>asSingleton());
 
@@ -251,7 +258,7 @@ public class TFIDF {
       // Compute a mapping from each word to the total
       // number of documents in which it appears.
       PCollection<KV<String, Long>> wordToDocCount = uriToWords
-          .apply("RemoveDuplicateWords", RemoveDuplicates.<KV<URI, String>>create())
+          .apply("DistinctWords", Distinct.<KV<URI, String>>create())
           .apply(Values.<String>create())
           .apply("CountDocs", Count.<String>perElement());
 
@@ -412,7 +419,7 @@ public class TFIDF {
     }
 
     @Override
-    public PDone apply(PCollection<KV<String, KV<URI, Double>>> wordToUriAndTfIdf) {
+    public PDone expand(PCollection<KV<String, KV<URI, Double>>> wordToUriAndTfIdf) {
       return wordToUriAndTfIdf
           .apply("Format", ParDo.of(new DoFn<KV<String, KV<URI, Double>>, String>() {
             private static final long serialVersionUID = 0;

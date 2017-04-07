@@ -37,11 +37,11 @@ public final class ConsoleIO {
     private Write() {
     }
 
-    public static <T> Unbound<T> from() {
+    public static <T> Unbound<T> out() {
       return new Unbound<>(10);
     }
 
-    public static <T> Unbound<T> from(int num) {
+    public static <T> Unbound<T> out(int num) {
       return new Unbound<>(num);
     }
 
@@ -62,7 +62,7 @@ public final class ConsoleIO {
       }
 
       @Override
-      public PDone apply(PCollection<T> input) {
+      public PDone expand(PCollection<T> input) {
         return PDone.in(input.getPipeline());
       }
     }

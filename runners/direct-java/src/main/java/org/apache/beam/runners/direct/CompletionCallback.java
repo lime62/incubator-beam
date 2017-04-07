@@ -28,7 +28,7 @@ interface CompletionCallback {
    * Handle a successful result, returning the committed outputs of the result.
    */
   CommittedResult handleResult(
-      CommittedBundle<?> inputBundle, TransformResult result);
+      CommittedBundle<?> inputBundle, TransformResult<?> result);
 
   /**
    * Handle an input bundle that did not require processing.
@@ -38,7 +38,7 @@ interface CompletionCallback {
   void handleEmpty(AppliedPTransform<?, ?, ?> transform);
 
   /**
-   * Handle a result that terminated abnormally due to the provided {@link Throwable}.
+   * Handle a result that terminated abnormally due to the provided {@link Exception}.
    */
-  void handleThrowable(CommittedBundle<?> inputBundle, Throwable t);
+  void handleException(CommittedBundle<?> inputBundle, Exception t);
 }

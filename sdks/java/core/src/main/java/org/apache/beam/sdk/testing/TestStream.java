@@ -42,10 +42,14 @@ import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
 import org.apache.beam.sdk.util.PropertyNames;
 import org.apache.beam.sdk.util.VarInt;
+import org.apache.beam.sdk.util.WindowingStrategy;
 import org.apache.beam.sdk.values.PBegin;
 import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.PCollection.IsBounded;
 import org.apache.beam.sdk.values.TimestampedValue;
 import org.apache.beam.sdk.values.TimestampedValue.TimestampedValueCoder;
+import org.apache.beam.sdk.values.TypeDescriptor;
+import org.apache.beam.sdk.values.TypeParameter;
 import org.joda.time.Duration;
 import org.joda.time.Instant;
 import org.joda.time.ReadableDuration;
@@ -105,7 +109,7 @@ public final class TestStream<T> extends PTransform<PBegin, PCollection<T>> {
     @SafeVarargs
     public final Builder<T> addElements(T element, T... elements) {
       TimestampedValue<T> firstElement = TimestampedValue.of(element, currentWatermark);
-      @SuppressWarnings("unchecked")
+      @SuppressWarnings({"unchecked", "rawtypes"})
       TimestampedValue<T>[] remainingElements = new TimestampedValue[elements.length];
       for (int i = 0; i < elements.length; i++) {
         remainingElements[i] = TimestampedValue.of(elements[i], currentWatermark);
@@ -252,12 +256,10 @@ public final class TestStream<T> extends PTransform<PBegin, PCollection<T>> {
   }
 
   @Override
-  public PCollection<T> apply(PBegin input) {
-    throw new IllegalStateException(
-        String.format(
-            "Pipeline Runner %s does not provide a required override for %s",
-            input.getPipeline().getRunner().getClass().getSimpleName(),
-            getClass().getSimpleName()));
+  public PCollection<T> expand(PBegin input) {
+    return PCollection.<T>createPrimitiveOutputInternal(
+            input.getPipeline(), WindowingStrategy.globalDefault(), IsBounded.UNBOUNDED)
+        .setCoder(coder);
   }
 
   public Coder<T> getValueCoder() {
@@ -363,6 +365,12 @@ public final class TestStream<T> extends PTransform<PBegin, PCollection<T>> {
       elementCoder.verifyDeterministic();
       DURATION_CODER.verifyDeterministic();
       INSTANT_CODER.verifyDeterministic();
+    }
+
+    @Override
+    public TypeDescriptor<Event<T>> getEncodedTypeDescriptor() {
+      return new TypeDescriptor<Event<T>>() {}.where(
+          new TypeParameter<T>() {}, valueCoder.getEncodedTypeDescriptor());
     }
   }
 }

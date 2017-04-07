@@ -21,14 +21,10 @@ import org.apache.beam.sdk.annotations.Experimental;
 import org.apache.beam.sdk.annotations.Experimental.Kind;
 
 /**
- * A {@code StateContents} is produced by the read methods on all {@link State} objects.
- * Calling {@link #read} returns the associated value.
+ * {@link State} that can be read via {@link #read()}.
  *
- * <p>This class is similar to {@link java.util.concurrent.Future}, but each invocation of
- * {@link #read} need not return the same value.
- *
- * <p>Getting the {@code StateContents} from a read method indicates the desire to eventually
- * read a value. Depending on the runner this may or may not immediately start the read.
+ * <p>Use {@link #readLater()} for marking several states for prefetching. Runners
+ * can potentially batch these into one read.
  *
  * @param <T> The type of value returned by {@link #read}.
  */
@@ -39,14 +35,14 @@ public interface ReadableState<T> {
    *
    * <p>If there will be many calls to {@link #read} for different state in short succession,
    * you should first call {@link #readLater} for all of them so the reads can potentially be
-   * batched (depending on the underlying {@link StateInternals} implementation}.
+   * batched (depending on the underlying implementation}.
    */
   T read();
 
   /**
    * Indicate that the value will be read later.
    *
-   * <p>This allows a {@link StateInternals} implementation to start an asynchronous prefetch or
+   * <p>This allows an implementation to start an asynchronous prefetch or
    * to include this state in the next batch of reads.
    *
    * @return this for convenient chaining

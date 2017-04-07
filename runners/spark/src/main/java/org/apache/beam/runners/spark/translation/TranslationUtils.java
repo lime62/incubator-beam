@@ -23,22 +23,27 @@ import com.google.common.collect.Maps;
 import java.io.Serializable;
 import java.util.List;
 import java.util.Map;
-import org.apache.beam.runners.spark.util.BroadcastHelper;
-import org.apache.beam.sdk.coders.Coder;
-import org.apache.beam.sdk.transforms.Combine;
+import org.apache.beam.runners.core.InMemoryStateInternals;
+import org.apache.beam.runners.core.StateInternals;
+import org.apache.beam.runners.core.StateInternalsFactory;
+import org.apache.beam.runners.spark.SparkRunner;
+import org.apache.beam.runners.spark.util.SideInputBroadcast;
+import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.reflect.DoFnSignature;
+import org.apache.beam.sdk.transforms.reflect.DoFnSignatures;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
 import org.apache.beam.sdk.transforms.windowing.GlobalWindows;
 import org.apache.beam.sdk.transforms.windowing.Window;
 import org.apache.beam.sdk.transforms.windowing.WindowFn;
 import org.apache.beam.sdk.util.WindowedValue;
-import org.apache.beam.sdk.util.state.InMemoryStateInternals;
-import org.apache.beam.sdk.util.state.StateInternals;
-import org.apache.beam.sdk.util.state.StateInternalsFactory;
+import org.apache.beam.sdk.util.WindowingStrategy;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollectionView;
 import org.apache.beam.sdk.values.TupleTag;
+import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.Function;
 import org.apache.spark.api.java.function.PairFunction;
+import org.apache.spark.api.java.function.VoidFunction;
 import org.apache.spark.streaming.api.java.JavaDStream;
 import org.apache.spark.streaming.api.java.JavaPairDStream;
 
@@ -66,7 +71,7 @@ public final class TranslationUtils {
   }
 
   /**
-   * A {@link Combine.GroupedValues} function applied to grouped KVs.
+   * A SparkKeyedCombineFn function applied to grouped KVs.
    *
    * @param <K>       Grouped key type.
    * @param <InputT>  Grouped values type.
@@ -74,18 +79,16 @@ public final class TranslationUtils {
    */
   public static class CombineGroupedValues<K, InputT, OutputT> implements
       Function<WindowedValue<KV<K, Iterable<InputT>>>, WindowedValue<KV<K, OutputT>>> {
-    private final Combine.KeyedCombineFn<K, InputT, ?, OutputT> keyed;
+    private final SparkKeyedCombineFn<K, InputT, ?, OutputT> fn;
 
-    public CombineGroupedValues(Combine.GroupedValues<K, InputT, OutputT> transform) {
-      //noinspection unchecked
-      keyed = (Combine.KeyedCombineFn<K, InputT, ?, OutputT>) transform.getFn();
+    public CombineGroupedValues(SparkKeyedCombineFn<K, InputT, ?, OutputT> fn) {
+      this.fn = fn;
     }
 
     @Override
     public WindowedValue<KV<K, OutputT>> call(WindowedValue<KV<K, Iterable<InputT>>> windowedKv)
         throws Exception {
-      KV<K, Iterable<InputT>> kv = windowedKv.getValue();
-      return WindowedValue.of(KV.of(kv.getKey(), keyed.apply(kv.getKey(), kv.getValue())),
+      return WindowedValue.of(KV.of(windowedKv.getValue().getKey(), fn.apply(windowedKv)),
           windowedKv.getTimestamp(), windowedKv.getWindows(), windowedKv.getPane());
     }
   }
@@ -99,14 +102,14 @@ public final class TranslationUtils {
    * with triggering or allowed lateness).
    * </p>
    *
-   * @param transform The {@link Window.Bound} transformation.
+   * @param transform The {@link Window.Assign} transformation.
    * @param context   The {@link EvaluationContext}.
    * @param <T>       PCollection type.
    * @param <W>       {@link BoundedWindow} type.
    * @return if to apply the transformation.
    */
   public static <T, W extends BoundedWindow> boolean
-  skipAssignWindows(Window.Bound<T> transform, EvaluationContext context) {
+  skipAssignWindows(Window.Assign<T> transform, EvaluationContext context) {
     @SuppressWarnings("unchecked")
     WindowFn<? super T, W> windowFn = (WindowFn<? super T, W>) transform.getWindowFn();
     return windowFn == null
@@ -126,7 +129,7 @@ public final class TranslationUtils {
   }
 
   /** {@link KV} to pair function. */
-  static <K, V> PairFunction<KV<K, V>, K, V> toPairFunction() {
+  public static <K, V> PairFunction<KV<K, V>, K, V> toPairFunction() {
     return new PairFunction<KV<K, V>, K, V>() {
       @Override
       public Tuple2<K, V> call(KV<K, V> kv) {
@@ -141,6 +144,28 @@ public final class TranslationUtils {
       @Override
       public KV<K, V> call(Tuple2<K, V> t2) {
         return KV.of(t2._1(), t2._2());
+      }
+    };
+  }
+
+  /** Extract key from a {@link WindowedValue} {@link KV} into a pair. */
+  public static <K, V> PairFunction<WindowedValue<KV<K, V>>, K, WindowedValue<KV<K, V>>>
+      toPairByKeyInWindowedValue() {
+        return new PairFunction<WindowedValue<KV<K, V>>, K, WindowedValue<KV<K, V>>>() {
+          @Override
+          public Tuple2<K, WindowedValue<KV<K, V>>> call(
+              WindowedValue<KV<K, V>> windowedKv) throws Exception {
+                return new Tuple2<>(windowedKv.getValue().getKey(), windowedKv);
+              }
+        };
+      }
+
+  /** Extract window from a {@link KV} with {@link WindowedValue} value. */
+  static <K, V> Function<KV<K, WindowedValue<V>>, WindowedValue<KV<K, V>>> toKVByWindowInValue() {
+    return new Function<KV<K, WindowedValue<V>>, WindowedValue<KV<K, V>>>() {
+      @Override public WindowedValue<KV<K, V>> call(KV<K, WindowedValue<V>> kv) throws Exception {
+        WindowedValue<V> wv = kv.getValue();
+        return wv.withValue(KV.of(kv.getKey(), wv.getValue()));
       }
     };
   }
@@ -165,31 +190,89 @@ public final class TranslationUtils {
     }
   }
 
-  /***
+  /**
    * Create SideInputs as Broadcast variables.
    *
    * @param views   The {@link PCollectionView}s.
    * @param context The {@link EvaluationContext}.
-   * @return a map of tagged {@link BroadcastHelper}s.
+   * @return a map of tagged {@link SideInputBroadcast}s and their {@link WindowingStrategy}.
    */
-  public static Map<TupleTag<?>, BroadcastHelper<?>> getSideInputs(List<PCollectionView<?>> views,
-      EvaluationContext context) {
+  static Map<TupleTag<?>, KV<WindowingStrategy<?, ?>, SideInputBroadcast<?>>>
+  getSideInputs(List<PCollectionView<?>> views, EvaluationContext context) {
+    return getSideInputs(views, context.getSparkContext(), context.getPViews());
+  }
+
+  /**
+   * Create SideInputs as Broadcast variables.
+   *
+   * @param views   The {@link PCollectionView}s.
+   * @param context The {@link JavaSparkContext}.
+   * @param pviews  The {@link SparkPCollectionView}.
+   * @return a map of tagged {@link SideInputBroadcast}s and their {@link WindowingStrategy}.
+   */
+  public static Map<TupleTag<?>, KV<WindowingStrategy<?, ?>, SideInputBroadcast<?>>>
+  getSideInputs(
+      List<PCollectionView<?>> views,
+      JavaSparkContext context,
+      SparkPCollectionView pviews) {
     if (views == null) {
       return ImmutableMap.of();
     } else {
-      Map<TupleTag<?>, BroadcastHelper<?>> sideInputs = Maps.newHashMap();
+      Map<TupleTag<?>, KV<WindowingStrategy<?, ?>, SideInputBroadcast<?>>> sideInputs =
+          Maps.newHashMap();
       for (PCollectionView<?> view : views) {
-        Iterable<? extends WindowedValue<?>> collectionView = context.getPCollectionView(view);
-        Coder<Iterable<WindowedValue<?>>> coderInternal = view.getCoderInternal();
-        @SuppressWarnings("unchecked")
-        BroadcastHelper<?> helper =
-            BroadcastHelper.create((Iterable<WindowedValue<?>>) collectionView, coderInternal);
-        //broadcast side inputs
-        helper.broadcast(context.getSparkContext());
-        sideInputs.put(view.getTagInternal(), helper);
+        SideInputBroadcast helper = pviews.getPCollectionView(view, context);
+        WindowingStrategy<?, ?> windowingStrategy = view.getWindowingStrategyInternal();
+        sideInputs.put(view.getTagInternal(),
+            KV.<WindowingStrategy<?, ?>, SideInputBroadcast<?>>of(windowingStrategy, helper));
       }
       return sideInputs;
     }
   }
 
+  public static void rejectSplittable(DoFn<?, ?> doFn) {
+    DoFnSignature signature = DoFnSignatures.getSignature(doFn.getClass());
+
+    if (signature.processElement().isSplittable()) {
+      throw new UnsupportedOperationException(
+          String.format(
+              "%s does not support splittable DoFn: %s", SparkRunner.class.getSimpleName(), doFn));
+    }
+  }
+  /**
+   * Reject state and timers {@link DoFn}.
+   *
+   * @param doFn the {@link DoFn} to possibly reject.
+   */
+  public static void rejectStateAndTimers(DoFn<?, ?> doFn) {
+    DoFnSignature signature = DoFnSignatures.getSignature(doFn.getClass());
+
+    if (signature.stateDeclarations().size() > 0) {
+      throw new UnsupportedOperationException(
+          String.format(
+              "Found %s annotations on %s, but %s cannot yet be used with state in the %s.",
+              DoFn.StateId.class.getSimpleName(),
+              doFn.getClass().getName(),
+              DoFn.class.getSimpleName(),
+              SparkRunner.class.getSimpleName()));
+    }
+
+    if (signature.timerDeclarations().size() > 0) {
+      throw new UnsupportedOperationException(
+          String.format(
+              "Found %s annotations on %s, but %s cannot yet be used with timers in the %s.",
+              DoFn.TimerId.class.getSimpleName(),
+              doFn.getClass().getName(),
+              DoFn.class.getSimpleName(),
+              SparkRunner.class.getSimpleName()));
+    }
+  }
+
+  public static <T> VoidFunction<T> emptyVoidFunction() {
+    return new VoidFunction<T>() {
+      @Override public void call(T t) throws Exception {
+        // Empty implementation.
+      }
+    };
+  }
 }

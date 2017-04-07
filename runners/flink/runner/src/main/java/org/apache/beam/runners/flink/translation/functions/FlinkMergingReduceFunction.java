@@ -26,14 +26,14 @@ import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import org.apache.beam.runners.core.PerKeyCombineFnRunner;
+import org.apache.beam.runners.core.PerKeyCombineFnRunners;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.transforms.CombineFnBase;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
 import org.apache.beam.sdk.transforms.windowing.IntervalWindow;
 import org.apache.beam.sdk.transforms.windowing.OutputTimeFn;
 import org.apache.beam.sdk.transforms.windowing.PaneInfo;
-import org.apache.beam.sdk.util.PerKeyCombineFnRunner;
-import org.apache.beam.sdk.util.PerKeyCombineFnRunners;
 import org.apache.beam.sdk.util.WindowedValue;
 import org.apache.beam.sdk.util.WindowingStrategy;
 import org.apache.beam.sdk.values.KV;
@@ -62,14 +62,10 @@ public class FlinkMergingReduceFunction<K, AccumT, OutputT, W extends IntervalWi
       Iterable<WindowedValue<KV<K, AccumT>>> elements,
       Collector<WindowedValue<KV<K, OutputT>>> out) throws Exception {
 
-    FlinkProcessContext<KV<K, AccumT>, KV<K, OutputT>> processContext =
-        new FlinkProcessContext<>(
-            serializedOptions.getPipelineOptions(),
-            getRuntimeContext(),
-            doFn,
-            windowingStrategy,
-            out,
-            sideInputs);
+    PipelineOptions options = serializedOptions.getPipelineOptions();
+
+    FlinkSideInputReader sideInputReader =
+        new FlinkSideInputReader(sideInputs, getRuntimeContext());
 
     PerKeyCombineFnRunner<K, ?, AccumT, OutputT> combineFnRunner =
         PerKeyCombineFnRunners.create(combineFn);
@@ -78,13 +74,12 @@ public class FlinkMergingReduceFunction<K, AccumT, OutputT, W extends IntervalWi
     OutputTimeFn<? super BoundedWindow> outputTimeFn =
         (OutputTimeFn<? super BoundedWindow>) windowingStrategy.getOutputTimeFn();
 
-
     // get all elements so that we can sort them, has to fit into
     // memory
     // this seems very unprudent, but correct, for now
     ArrayList<WindowedValue<KV<K, AccumT>>> sortedInput = Lists.newArrayList();
-    for (WindowedValue<KV<K, AccumT>> inputValue: elements) {
-      for (WindowedValue<KV<K, AccumT>> exploded: inputValue.explodeWindows()) {
+    for (WindowedValue<KV<K, AccumT>> inputValue : elements) {
+      for (WindowedValue<KV<K, AccumT>> exploded : inputValue.explodeWindows()) {
         sortedInput.add(exploded);
       }
     }
@@ -127,25 +122,24 @@ public class FlinkMergingReduceFunction<K, AccumT, OutputT, W extends IntervalWi
       if (nextWindow.equals(currentWindow)) {
         // continue accumulating and merge windows
 
-        processContext = processContext.forWindowedValue(nextValue);
-
         accumulator = combineFnRunner.mergeAccumulators(
-            key, ImmutableList.of(accumulator, nextValue.getValue().getValue()), processContext);
+            key, ImmutableList.of(accumulator, nextValue.getValue().getValue()),
+            options, sideInputReader, currentValue.getWindows());
 
         windowTimestamps.add(nextValue.getTimestamp());
       } else {
         out.collect(
             WindowedValue.of(
-                KV.of(key, combineFnRunner.extractOutput(key, accumulator, processContext)),
+                KV.of(key, combineFnRunner.extractOutput(key, accumulator,
+                    options, sideInputReader, currentValue.getWindows())),
                 outputTimeFn.merge(currentWindow, windowTimestamps),
                 currentWindow,
                 PaneInfo.NO_FIRING));
 
         windowTimestamps.clear();
 
-        processContext = processContext.forWindowedValue(nextValue);
-
         currentWindow = nextWindow;
+        currentValue = nextValue;
         accumulator = nextValue.getValue().getValue();
         windowTimestamps.add(nextValue.getTimestamp());
       }
@@ -154,7 +148,8 @@ public class FlinkMergingReduceFunction<K, AccumT, OutputT, W extends IntervalWi
     // emit the final accumulator
     out.collect(
         WindowedValue.of(
-            KV.of(key, combineFnRunner.extractOutput(key, accumulator, processContext)),
+            KV.of(key, combineFnRunner.extractOutput(key, accumulator,
+                options, sideInputReader, currentValue.getWindows())),
             outputTimeFn.merge(currentWindow, windowTimestamps),
             currentWindow,
             PaneInfo.NO_FIRING));

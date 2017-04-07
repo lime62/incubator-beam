@@ -27,6 +27,7 @@ import org.apache.beam.examples.complete.game.utils.WriteToBigQuery;
 import org.apache.beam.examples.complete.game.utils.WriteWindowedToBigQuery;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.PipelineResult;
+import org.apache.beam.sdk.coders.StringUtf8Coder;
 import org.apache.beam.sdk.io.PubsubIO;
 import org.apache.beam.sdk.options.Default;
 import org.apache.beam.sdk.options.Description;
@@ -57,26 +58,26 @@ import org.joda.time.format.DateTimeFormatter;
  * early/speculative results; using .accumulatingFiredPanes() to do cumulative processing of late-
  * arriving data.
  *
- * <p> This pipeline processes an unbounded stream of 'game events'. The calculation of the team
+ * <p>This pipeline processes an unbounded stream of 'game events'. The calculation of the team
  * scores uses fixed windowing based on event time (the time of the game play event), not
  * processing time (the time that an event is processed by the pipeline). The pipeline calculates
  * the sum of scores per team, for each window. By default, the team scores are calculated using
  * one-hour windows.
  *
- * <p> In contrast-- to demo another windowing option-- the user scores are calculated using a
+ * <p>In contrast-- to demo another windowing option-- the user scores are calculated using a
  * global window, which periodically (every ten minutes) emits cumulative user score sums.
  *
- * <p> In contrast to the previous pipelines in the series, which used static, finite input data,
+ * <p>In contrast to the previous pipelines in the series, which used static, finite input data,
  * here we're using an unbounded data source, which lets us provide speculative results, and allows
  * handling of late data, at much lower latency. We can use the early/speculative results to keep a
  * 'leaderboard' updated in near-realtime. Our handling of late data lets us generate correct
  * results, e.g. for 'team prizes'. We're now outputting window results as they're
  * calculated, giving us much lower latency than with the previous batch examples.
  *
- * <p> Run {@link injector.Injector} to generate pubsub data for this pipeline.  The Injector
+ * <p>Run {@code injector.Injector} to generate pubsub data for this pipeline.  The Injector
  * documentation provides more detail on how to do this.
  *
- * <p> To execute this pipeline using the Dataflow service, specify the pipeline configuration
+ * <p>To execute this pipeline using the Dataflow service, specify the pipeline configuration
  * like this:
  * <pre>{@code
  *   --project=YOUR_PROJECT_ID
@@ -103,7 +104,7 @@ public class LeaderBoard extends HourlyTeamScore {
   /**
    * Options supported by {@link LeaderBoard}.
    */
-  static interface Options extends HourlyTeamScore.Options, ExampleOptions, StreamingOptions {
+  interface Options extends HourlyTeamScore.Options, ExampleOptions, StreamingOptions {
 
     @Description("Pub/Sub topic to read from")
     @Validation.Required
@@ -120,12 +121,10 @@ public class LeaderBoard extends HourlyTeamScore {
     Integer getAllowedLateness();
     void setAllowedLateness(Integer value);
 
-    @Override
     @Description("Prefix used for the BigQuery table names")
     @Default.String("leaderboard")
-    String getTableName();
-    @Override
-    void setTableName(String value);
+    String getLeaderBoardTableName();
+    void setLeaderBoardTableName(String value);
   }
 
   /**
@@ -137,24 +136,30 @@ public class LeaderBoard extends HourlyTeamScore {
 
     Map<String, WriteWindowedToBigQuery.FieldInfo<KV<String, Integer>>> tableConfigure =
         new HashMap<String, WriteWindowedToBigQuery.FieldInfo<KV<String, Integer>>>();
-    tableConfigure.put("team",
-        new WriteWindowedToBigQuery.FieldInfo<KV<String, Integer>>("STRING",
-            c -> c.element().getKey()));
-    tableConfigure.put("total_score",
-        new WriteWindowedToBigQuery.FieldInfo<KV<String, Integer>>("INTEGER",
-            c -> c.element().getValue()));
-    tableConfigure.put("window_start",
-        new WriteWindowedToBigQuery.FieldInfo<KV<String, Integer>>("STRING",
-          c -> {
-            IntervalWindow w = (IntervalWindow) c.window();
-            return fmt.print(w.start());
-          }));
-    tableConfigure.put("processing_time",
+    tableConfigure.put(
+        "team",
         new WriteWindowedToBigQuery.FieldInfo<KV<String, Integer>>(
-            "STRING", c -> fmt.print(Instant.now())));
-    tableConfigure.put("timing",
+            "STRING", (c, w) -> c.element().getKey()));
+    tableConfigure.put(
+        "total_score",
         new WriteWindowedToBigQuery.FieldInfo<KV<String, Integer>>(
-            "STRING", c -> c.pane().getTiming().toString()));
+            "INTEGER", (c, w) -> c.element().getValue()));
+    tableConfigure.put(
+        "window_start",
+        new WriteWindowedToBigQuery.FieldInfo<KV<String, Integer>>(
+            "STRING",
+            (c, w) -> {
+              IntervalWindow window = (IntervalWindow) w;
+              return fmt.print(window.start());
+            }));
+    tableConfigure.put(
+        "processing_time",
+        new WriteWindowedToBigQuery.FieldInfo<KV<String, Integer>>(
+            "STRING", (c, w) -> fmt.print(Instant.now())));
+    tableConfigure.put(
+        "timing",
+        new WriteWindowedToBigQuery.FieldInfo<KV<String, Integer>>(
+            "STRING", (c, w) -> c.pane().getTiming().toString()));
     return tableConfigure;
   }
 
@@ -167,9 +172,10 @@ public class LeaderBoard extends HourlyTeamScore {
 
     Map<String, WriteToBigQuery.FieldInfo<KV<String, Integer>>> tableConfigure =
         configureBigQueryWrite();
-    tableConfigure.put("processing_time",
+    tableConfigure.put(
+        "processing_time",
         new WriteToBigQuery.FieldInfo<KV<String, Integer>>(
-            "STRING", c -> fmt.print(Instant.now())));
+            "STRING", (c, w) -> fmt.print(Instant.now())));
     return tableConfigure;
   }
 
@@ -185,7 +191,9 @@ public class LeaderBoard extends HourlyTeamScore {
     // Read game events from Pub/Sub using custom timestamps, which are extracted from the pubsub
     // data elements, and parse the data.
     PCollection<GameActionInfo> gameEvents = pipeline
-        .apply(PubsubIO.Read.timestampLabel(TIMESTAMP_ATTRIBUTE).topic(options.getTopic()))
+        .apply(PubsubIO.<String>read()
+            .timestampLabel(TIMESTAMP_ATTRIBUTE).topic(options.getTopic())
+            .withCoder(StringUtf8Coder.of()))
         .apply("ParseGameEvent", ParDo.of(new ParseEventFn()));
 
     gameEvents.apply("CalculateTeamScores",
@@ -195,7 +203,7 @@ public class LeaderBoard extends HourlyTeamScore {
         // Write the results to BigQuery.
         .apply("WriteTeamScoreSums",
                new WriteWindowedToBigQuery<KV<String, Integer>>(
-                  options.getTableName() + "_team", configureWindowedTableWrite()));
+                  options.getLeaderBoardTableName() + "_team", configureWindowedTableWrite()));
     gameEvents
         .apply(
             "CalculateUserScores",
@@ -204,7 +212,7 @@ public class LeaderBoard extends HourlyTeamScore {
         .apply(
             "WriteUserScoreSums",
             new WriteToBigQuery<KV<String, Integer>>(
-                options.getTableName() + "_user", configureGlobalWindowBigQueryWrite()));
+                options.getLeaderBoardTableName() + "_user", configureGlobalWindowBigQueryWrite()));
 
     // Run the pipeline and wait for the pipeline to finish; capture cancellation requests from the
     // command line.
@@ -229,7 +237,7 @@ public class LeaderBoard extends HourlyTeamScore {
     }
 
     @Override
-    public PCollection<KV<String, Integer>> apply(PCollection<GameActionInfo> infos) {
+    public PCollection<KV<String, Integer>> expand(PCollection<GameActionInfo> infos) {
       return infos.apply("LeaderboardTeamFixedWindows",
           Window.<GameActionInfo>into(FixedWindows.of(teamWindowDuration))
               // We will get early (speculative) results as well as cumulative
@@ -262,7 +270,7 @@ public class LeaderBoard extends HourlyTeamScore {
     }
 
     @Override
-    public PCollection<KV<String, Integer>> apply(PCollection<GameActionInfo> input) {
+    public PCollection<KV<String, Integer>> expand(PCollection<GameActionInfo> input) {
       return input.apply("LeaderboardUserGlobalWindow",
           Window.<GameActionInfo>into(new GlobalWindows())
               // Get periodic results every ten minutes.

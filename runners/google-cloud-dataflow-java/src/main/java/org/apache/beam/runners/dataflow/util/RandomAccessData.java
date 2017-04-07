@@ -44,8 +44,8 @@ import org.apache.beam.sdk.util.VarInt;
  * also provides random access to bytes stored within. This wrapper allows users to finely
  * control the number of byte copies that occur.
  *
- * Anything stored within the in-memory buffer from offset {@link #size()} is considered temporary
- * unused storage.
+ * <p>Anything stored within the in-memory buffer from offset {@link #size()} is considered
+ * temporary unused storage.
  */
 @NotThreadSafe
 public class RandomAccessData {
@@ -54,7 +54,7 @@ public class RandomAccessData {
    * This follows the same encoding scheme as {@link ByteArrayCoder}.
    * This coder is deterministic and consistent with equals.
    *
-   * This coder does not support encoding positive infinity.
+   * <p>This coder does not support encoding positive infinity.
    */
   public static class RandomAccessDataCoder extends AtomicCoder<RandomAccessData> {
     private static final RandomAccessDataCoder INSTANCE = new RandomAccessDataCoder();
@@ -121,7 +121,7 @@ public class RandomAccessData {
    * A {@link Comparator} that compares two byte arrays lexicographically. It compares
    * values as a list of unsigned bytes. The first pair of values that follow any common prefix,
    * or when one array is a prefix of the other, treats the shorter array as the lesser.
-   * For example, [] < [0x01] < [0x01, 0x7F] < [0x01, 0x80] < [0x02] < POSITIVE INFINITY.
+   * For example, {@code [] < [0x01] < [0x01, 0x7F] < [0x01, 0x80] < [0x02] < POSITIVE INFINITY}.
    *
    * <p>Note that a token type of positive infinity is supported and is greater than
    * all other {@link RandomAccessData}.
@@ -192,7 +192,7 @@ public class RandomAccessData {
    * is strictly greater than this. Note that if this is empty or is all 0xFF then
    * a token value of positive infinity is returned.
    *
-   * The {@link UnsignedLexicographicalComparator} supports comparing {@link RandomAccessData}
+   * <p>The {@link UnsignedLexicographicalComparator} supports comparing {@link RandomAccessData}
    * with support for positive infinitiy.
    */
   public RandomAccessData increment() throws IOException {

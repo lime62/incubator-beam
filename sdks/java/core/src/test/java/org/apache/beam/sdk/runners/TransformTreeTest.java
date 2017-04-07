@@ -22,7 +22,6 @@ import static org.hamcrest.Matchers.not;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
 
 import java.io.File;
 import java.util.Arrays;
@@ -35,8 +34,10 @@ import org.apache.beam.sdk.io.TextIO;
 import org.apache.beam.sdk.io.Write;
 import org.apache.beam.sdk.testing.NeedsRunner;
 import org.apache.beam.sdk.testing.TestPipeline;
+import org.apache.beam.sdk.transforms.Combine;
 import org.apache.beam.sdk.transforms.Count;
 import org.apache.beam.sdk.transforms.Create;
+import org.apache.beam.sdk.transforms.Flatten;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.Sample;
 import org.apache.beam.sdk.util.WindowingStrategy;
@@ -52,16 +53,18 @@ import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 
 /**
- * Tests for {@link TransformTreeNode} and {@link TransformHierarchy}.
+ * Tests for {@link TransformHierarchy.Node} and {@link TransformHierarchy}.
  */
 @RunWith(JUnit4.class)
 public class TransformTreeTest {
+
+  @Rule public final TestPipeline p = TestPipeline.create();
   @Rule public TemporaryFolder tmpFolder = new TemporaryFolder();
 
   enum TransformsSeen {
     READ,
     WRITE,
-    SAMPLE_ANY
+    COMBINE_GLOBALLY
   }
 
   /**
@@ -74,7 +77,7 @@ public class TransformTreeTest {
       extends PTransform<PBegin, PCollectionList<String>> {
 
     @Override
-    public PCollectionList<String> apply(PBegin b) {
+    public PCollectionList<String> expand(PBegin b) {
       // Composite transform: apply delegates to other transformations,
       // here a Create transform.
       PCollection<String> result = b.apply(Create.of("hello", "world"));
@@ -96,7 +99,7 @@ public class TransformTreeTest {
       extends PTransform<PCollection<Integer>, PDone> {
 
     @Override
-    public PDone apply(PCollection<Integer> input) {
+    public PDone expand(PCollection<Integer> input) {
       // Apply an operation so that this is a composite transform.
       input.apply(Count.<Integer>perElement());
 
@@ -113,13 +116,14 @@ public class TransformTreeTest {
   // visits the nodes and verifies that the hierarchy was captured.
   @Test
   public void testCompositeCapture() throws Exception {
+    p.enableAbandonedNodeEnforcement(false);
+
     File inputFile = tmpFolder.newFile();
     File outputFile = tmpFolder.newFile();
 
-    Pipeline p = TestPipeline.create();
-
     p.apply("ReadMyFile", TextIO.Read.from(inputFile.getPath()))
-        .apply(Sample.<String>any(10))
+        .apply(Combine.globally(Sample.<String>combineFn(10)))
+        .apply(Flatten.<String>iterables())
         .apply("WriteMyFile", TextIO.Write.to(outputFile.getPath()));
 
     final EnumSet<TransformsSeen> visited =
@@ -129,13 +133,13 @@ public class TransformTreeTest {
 
     p.traverseTopologically(new Pipeline.PipelineVisitor.Defaults() {
       @Override
-      public CompositeBehavior enterCompositeTransform(TransformTreeNode node) {
+      public CompositeBehavior enterCompositeTransform(TransformHierarchy.Node node) {
         PTransform<?, ?> transform = node.getTransform();
-        if (transform instanceof Sample.SampleAny) {
-          assertTrue(visited.add(TransformsSeen.SAMPLE_ANY));
+        if (transform instanceof Combine.Globally) {
+          assertTrue(visited.add(TransformsSeen.COMBINE_GLOBALLY));
           assertNotNull(node.getEnclosingNode());
           assertTrue(node.isCompositeNode());
-        } else if (transform instanceof Write.Bound) {
+        } else if (transform instanceof Write) {
           assertTrue(visited.add(TransformsSeen.WRITE));
           assertNotNull(node.getEnclosingNode());
           assertTrue(node.isCompositeNode());
@@ -145,19 +149,19 @@ public class TransformTreeTest {
       }
 
       @Override
-      public void leaveCompositeTransform(TransformTreeNode node) {
+      public void leaveCompositeTransform(TransformHierarchy.Node node) {
         PTransform<?, ?> transform = node.getTransform();
-        if (transform instanceof Sample.SampleAny) {
-          assertTrue(left.add(TransformsSeen.SAMPLE_ANY));
+        if (transform instanceof Combine.Globally) {
+          assertTrue(left.add(TransformsSeen.COMBINE_GLOBALLY));
         }
       }
 
       @Override
-      public void visitPrimitiveTransform(TransformTreeNode node) {
+      public void visitPrimitiveTransform(TransformHierarchy.Node node) {
         PTransform<?, ?> transform = node.getTransform();
         // Pick is a composite, should not be visited here.
-        assertThat(transform, not(instanceOf(Sample.SampleAny.class)));
-        assertThat(transform, not(instanceOf(Write.Bound.class)));
+        assertThat(transform, not(instanceOf(Combine.Globally.class)));
+        assertThat(transform, not(instanceOf(Write.class)));
         if (transform instanceof Read.Bounded
             && node.getEnclosingNode().getTransform() instanceof TextIO.Read.Bound) {
           assertTrue(visited.add(TransformsSeen.READ));
@@ -166,24 +170,20 @@ public class TransformTreeTest {
     });
 
     assertTrue(visited.equals(EnumSet.allOf(TransformsSeen.class)));
-    assertTrue(left.equals(EnumSet.of(TransformsSeen.SAMPLE_ANY)));
+    assertTrue(left.equals(EnumSet.of(TransformsSeen.COMBINE_GLOBALLY)));
   }
 
-  @Test(expected = IllegalStateException.class)
+  @Test(expected = IllegalArgumentException.class)
   public void testOutputChecking() throws Exception {
-    Pipeline p = TestPipeline.create();
+    p.enableAbandonedNodeEnforcement(false);
 
     p.apply(new InvalidCompositeTransform());
-
     p.traverseTopologically(new Pipeline.PipelineVisitor.Defaults() {});
-    fail("traversal should have failed with an IllegalStateException");
   }
 
   @Test
   @Category(NeedsRunner.class)
   public void testMultiGraphSetup() {
-    Pipeline p = TestPipeline.create();
-
     PCollection<Integer> input = p.begin()
         .apply(Create.of(1, 2, 3));
 

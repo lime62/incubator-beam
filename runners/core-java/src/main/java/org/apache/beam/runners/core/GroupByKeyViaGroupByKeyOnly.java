@@ -26,16 +26,13 @@ import java.util.List;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.IterableCoder;
 import org.apache.beam.sdk.coders.KvCoder;
+import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.GroupByKey;
-import org.apache.beam.sdk.transforms.OldDoFn;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
-import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
-import org.apache.beam.sdk.util.ReifyTimestampsAndWindows;
 import org.apache.beam.sdk.util.WindowedValue;
 import org.apache.beam.sdk.util.WindowedValue.WindowedValueCoder;
 import org.apache.beam.sdk.util.WindowingStrategy;
-import org.apache.beam.sdk.util.state.StateInternalsFactory;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 
@@ -80,19 +77,15 @@ public class GroupByKeyViaGroupByKeyOnly<K, V>
   }
 
   @Override
-  public PCollection<KV<K, Iterable<V>>> apply(PCollection<KV<K, V>> input) {
+  public PCollection<KV<K, Iterable<V>>> expand(PCollection<KV<K, V>> input) {
     WindowingStrategy<?, ?> windowingStrategy = input.getWindowingStrategy();
 
     return input
-        // Make each input element's timestamp and assigned windows
-        // explicit, in the value part.
-        .apply(new ReifyTimestampsAndWindows<K, V>())
-
         // Group by just the key.
         // Combiner lifting will not happen regardless of the disallowCombinerLifting value.
         // There will be no combiners right after the GroupByKeyOnly because of the two ParDos
         // introduced in here.
-        .apply(new GroupByKeyOnly<K, WindowedValue<V>>())
+        .apply(new GroupByKeyOnly<K, V>())
 
         // Sort each key's values by timestamp. GroupAlsoByWindow requires
         // its input to be sorted by timestamp.
@@ -112,12 +105,12 @@ public class GroupByKeyViaGroupByKeyOnly<K, V>
    * or evaluate this class.
    */
   public static class GroupByKeyOnly<K, V>
-      extends PTransform<PCollection<KV<K, V>>, PCollection<KV<K, Iterable<V>>>> {
+      extends PTransform<PCollection<KV<K, V>>, PCollection<KV<K, Iterable<WindowedValue<V>>>>> {
 
     @SuppressWarnings({"rawtypes", "unchecked"})
     @Override
-    public PCollection<KV<K, Iterable<V>>> apply(PCollection<KV<K, V>> input) {
-      return PCollection.<KV<K, Iterable<V>>>createPrimitiveOutputInternal(
+    public PCollection<KV<K, Iterable<WindowedValue<V>>>> expand(PCollection<KV<K, V>> input) {
+      return PCollection.createPrimitiveOutputInternal(
           input.getPipeline(), input.getWindowingStrategy(), input.isBounded());
     }
 
@@ -135,15 +128,14 @@ public class GroupByKeyViaGroupByKeyOnly<K, V>
           PCollection<KV<K, Iterable<WindowedValue<V>>>>,
           PCollection<KV<K, Iterable<WindowedValue<V>>>>> {
     @Override
-    public PCollection<KV<K, Iterable<WindowedValue<V>>>> apply(
+    public PCollection<KV<K, Iterable<WindowedValue<V>>>> expand(
         PCollection<KV<K, Iterable<WindowedValue<V>>>> input) {
       return input
           .apply(
               ParDo.of(
-                  new OldDoFn<
-                      KV<K, Iterable<WindowedValue<V>>>,
-                      KV<K, Iterable<WindowedValue<V>>>>() {
-                    @Override
+                  new DoFn<KV<K, Iterable<WindowedValue<V>>>,
+                           KV<K, Iterable<WindowedValue<V>>>>() {
+                    @ProcessElement
                     public void processElement(ProcessContext c) {
                       KV<K, Iterable<WindowedValue<V>>> kvs = c.element();
                       K key = kvs.getKey();
@@ -233,7 +225,7 @@ public class GroupByKeyViaGroupByKeyOnly<K, V>
     }
 
     @Override
-    public PCollection<KV<K, Iterable<V>>> apply(
+    public PCollection<KV<K, Iterable<V>>> expand(
         PCollection<KV<K, Iterable<WindowedValue<V>>>> input) {
       @SuppressWarnings("unchecked")
       KvCoder<K, Iterable<WindowedValue<V>>> inputKvCoder =
@@ -255,17 +247,6 @@ public class GroupByKeyViaGroupByKeyOnly<K, V>
       return PCollection.<KV<K, Iterable<V>>>createPrimitiveOutputInternal(
           input.getPipeline(), windowingStrategy, input.isBounded())
           .setCoder(outputKvCoder);
-    }
-
-    private <W extends BoundedWindow>
-        GroupAlsoByWindowsViaOutputBufferDoFn<K, V, Iterable<V>, W> groupAlsoByWindowsFn(
-            WindowingStrategy<?, W> strategy,
-            StateInternalsFactory<K> stateInternalsFactory,
-            Coder<V> inputIterableElementValueCoder) {
-      return new GroupAlsoByWindowsViaOutputBufferDoFn<K, V, Iterable<V>, W>(
-          strategy,
-          stateInternalsFactory,
-          SystemReduceFn.<K, V, W>buffering(inputIterableElementValueCoder));
     }
   }
 }

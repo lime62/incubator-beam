@@ -21,13 +21,14 @@ import java.io.Serializable;
 import java.util.Arrays;
 import java.util.List;
 import org.apache.beam.examples.complete.game.GameStats.CalculateSpammyUsers;
-import org.apache.beam.sdk.Pipeline;
+import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.testing.PAssert;
 import org.apache.beam.sdk.testing.RunnableOnService;
 import org.apache.beam.sdk.testing.TestPipeline;
 import org.apache.beam.sdk.transforms.Create;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
+import org.junit.Rule;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
 import org.junit.runner.RunWith;
@@ -57,19 +58,24 @@ public class GameStatsTest implements Serializable {
   static final List<KV<String, Integer>> SPAMMERS = Arrays.asList(
       KV.of("Robot-2", 66), KV.of("Robot-1", 116));
 
+  @Rule
+  public TestPipeline p = TestPipeline.create();
+
   /** Test the calculation of 'spammy users'. */
   @Test
   @Category(RunnableOnService.class)
   public void testCalculateSpammyUsers() throws Exception {
-    Pipeline p = TestPipeline.create();
-
     PCollection<KV<String, Integer>> input = p.apply(Create.of(USER_SCORES));
     PCollection<KV<String, Integer>> output = input.apply(new CalculateSpammyUsers());
 
     // Check the set of spammers.
     PAssert.that(output).containsInAnyOrder(SPAMMERS);
 
-    p.run();
+    p.run().waitUntilFinish();
   }
 
+  @Test
+  public void testGameStatsOptions() {
+    PipelineOptionsFactory.as(GameStats.Options.class);
+  }
 }

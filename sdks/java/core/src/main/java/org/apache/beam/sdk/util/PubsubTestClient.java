@@ -25,6 +25,7 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -39,11 +40,11 @@ import org.apache.beam.sdk.options.PubsubOptions;
  * testing {@link #publish}, {@link #pull}, {@link #acknowledge} and {@link #modifyAckDeadline}
  * methods. Relies on statics to mimic the Pubsub service, though we try to hide that.
  */
-public class PubsubTestClient extends PubsubClient {
+public class PubsubTestClient extends PubsubClient implements Serializable {
   /**
    * Mimic the state of the simulated Pubsub 'service'.
    *
-   * Note that the {@link PubsubTestClientFactory} is serialized/deserialized even when running
+   * <p>Note that the {@link PubsubTestClientFactory} is serialized/deserialized even when running
    * test pipelines. Meanwhile it is valid for multiple {@link PubsubTestClient}s to be created
    * from the same client factory and run in parallel. Thus we can't enforce aliasing of the
    * following data structures over all clients and must resort to a static.
@@ -113,7 +114,8 @@ public class PubsubTestClient extends PubsubClient {
   private static final State STATE = new State();
 
   /** Closing the factory will validate all expected messages were processed. */
-  public interface PubsubTestClientFactory extends PubsubClientFactory, Closeable {
+  public interface PubsubTestClientFactory
+          extends PubsubClientFactory, Closeable, Serializable {
   }
 
   /**
@@ -209,6 +211,38 @@ public class PubsubTestClient extends PubsubClient {
           STATE.pendingAckIncomingMessages = null;
           STATE.ackDeadline = null;
         }
+      }
+    };
+  }
+
+  public static PubsubTestClientFactory createFactoryForCreateSubscription() {
+    return new PubsubTestClientFactory() {
+      int numCalls = 0;
+
+      @Override
+      public void close() throws IOException {
+        checkState(
+            numCalls == 1, "Expected exactly one subscription to be created, got %s", numCalls);
+      }
+
+      @Override
+      public PubsubClient newClient(
+          @Nullable String timestampLabel, @Nullable String idLabel, PubsubOptions options)
+          throws IOException {
+        return new PubsubTestClient() {
+          @Override
+          public void createSubscription(
+              TopicPath topic, SubscriptionPath subscription, int ackDeadlineSeconds)
+              throws IOException {
+            checkState(numCalls == 0, "Expected at most one subscription to be created");
+            numCalls++;
+          }
+        };
+      }
+
+      @Override
+      public String getKind() {
+        return "CreateSubscriptionTest";
       }
     };
   }

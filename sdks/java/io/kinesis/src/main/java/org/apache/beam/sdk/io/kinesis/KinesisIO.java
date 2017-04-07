@@ -40,72 +40,67 @@ import org.joda.time.Instant;
  * It follows the usage conventions laid out by other *IO classes like
  * BigQueryIO or PubsubIOLet's see how you can set up a simple Pipeline, which reads from Kinesis:
  *
- * <pre>{@code}
+ * <pre>{@code
  * p.
  *   apply(KinesisIO.Read.
  *     from("streamName", InitialPositionInStream.LATEST).
  *     using("AWS_KEY", _"AWS_SECRET", STREAM_REGION).
  *     apply( ... ) // other transformations
- *</pre>
- * </p>
+ * }</pre>
  *
- * <p>
- * As you can see you need to provide 3 things:
+ * <p>As you can see you need to provide 3 things:
  * <ul>
  *   <li>name of the stream you're going to read</li>
- *   <li>position in the stream where reading should start. There are two options:</li>
+ *   <li>position in the stream where reading should start. There are two options:
  *   <ul>
  *     <li>{@link InitialPositionInStream#LATEST} - reading will begin from end of the stream</li>
  *     <li>{@link InitialPositionInStream#TRIM_HORIZON} - reading will begin at
  *        the very beginning of the stream</li>
- *   </ul>
- *   <li>data used to initialize {@link AmazonKinesis} client</li>
+ *   </ul></li>
+ *   <li>data used to initialize {@link AmazonKinesis} client:
  *   <ul>
  *     <li>credentials (aws key, aws secret)</li>
  *    <li>region where the stream is located</li>
- *   </ul>
+ *   </ul></li>
  * </ul>
- * </p>
  *
  * <p>In case when you want to set up {@link AmazonKinesis} client by your own
  * (for example if you're using more sophisticated authorization methods like Amazon STS, etc.)
  * you can do it by implementing {@link KinesisClientProvider} class:
  *
- * <pre>{@code}
+ * <pre>{@code
  * public class MyCustomKinesisClientProvider implements KinesisClientProvider {
- *   @Override
+ *   {@literal @}Override
  *   public AmazonKinesis get() {
  *     // set up your client here
  *   }
  * }
- * </pre>
+ * }</pre>
  *
- * Usage is pretty straightforward:
+ * <p>Usage is pretty straightforward:
  *
- * <pre>{@code}
+ * <pre>{@code
  * p.
  *   apply(KinesisIO.Read.
  *    from("streamName", InitialPositionInStream.LATEST).
  *    using(MyCustomKinesisClientProvider()).
  *    apply( ... ) // other transformations
- * </pre>
- * </p>
+ * }</pre>
  *
  * <p>There’s also possibility to start reading using arbitrary point in time -
  * in this case you need to provide {@link Instant} object:
  *
- * <pre>{@code}
+ * <pre>{@code
  * p.
  *   apply(KinesisIO.Read.
  *     from("streamName", instant).
  *     using(MyCustomKinesisClientProvider()).
  *     apply( ... ) // other transformations
- * </pre>
- * </p>
+ * }</pre>
  *
  */
 public final class KinesisIO {
-    /***
+    /**
      * A {@link PTransform} that reads from a Kinesis stream.
      */
     public static final class Read {
@@ -118,7 +113,7 @@ public final class KinesisIO {
             this.initialPosition = checkNotNull(initialPosition, "initialPosition");
         }
 
-        /***
+        /**
          * Specify reading from streamName at some initial position.
          */
         public static Read from(String streamName, InitialPositionInStream initialPosition) {
@@ -126,7 +121,7 @@ public final class KinesisIO {
                     checkNotNull(initialPosition, "initialPosition")));
         }
 
-        /***
+        /**
          * Specify reading from streamName beginning at given {@link Instant}.
          * This {@link Instant} must be in the past, i.e. before {@link Instant#now()}.
          */
@@ -135,7 +130,7 @@ public final class KinesisIO {
                     checkNotNull(initialTimestamp, "initialTimestamp")));
         }
 
-        /***
+        /**
          * Allows to specify custom {@link KinesisClientProvider}.
          * {@link KinesisClientProvider} provides {@link AmazonKinesis} instances which are later
          * used for communication with Kinesis.
@@ -149,7 +144,7 @@ public final class KinesisIO {
                             initialPosition));
         }
 
-        /***
+        /**
          * Specify credential details and region to be used to read from Kinesis.
          * If you need more sophisticated credential protocol, then you should look at
          * {@link Read#using(KinesisClientProvider)}.

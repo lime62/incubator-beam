@@ -35,10 +35,10 @@ public interface FlinkPipelineOptions
 
   /**
    * List of local files to make available to workers.
-   * <p>
-   * Jars are placed on the worker's classpath.
-   * <p>
-   * The default value is the list of jars from the main program's classpath.
+   *
+   * <p>Jars are placed on the worker's classpath.
+   *
+   * <p>The default value is the list of jars from the main program's classpath.
    */
   @Description("Jar-Files to send to all workers and put on the classpath. "
       + "The default value is all files from the classpath.")
@@ -83,14 +83,19 @@ public interface FlinkPipelineOptions
   Long getExecutionRetryDelay();
   void setExecutionRetryDelay(Long delay);
 
+  @Description("Sets the behavior of reusing objects.")
+  @Default.Boolean(false)
+  Boolean getObjectReuse();
+  void setObjectReuse(Boolean reuse);
+
   /**
-   * Sets a state backend to store Beam's state during computation.
+   * State backend to store Beam's state during computation.
    * Note: Only applicable when executing in streaming mode.
-   * @param stateBackend The state backend to use
    */
   @Description("Sets the state backend to use in streaming mode. "
       + "Otherwise the default is read from the Flink config.")
-  void setStateBackend(AbstractStateBackend stateBackend);
+  @JsonIgnore
   AbstractStateBackend getStateBackend();
+  void setStateBackend(AbstractStateBackend stateBackend);
 
 }

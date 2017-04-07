@@ -22,24 +22,15 @@ import static org.junit.Assert.assertEquals;
 
 import java.io.File;
 import java.io.IOException;
-
-import org.apache.beam.runners.spark.EvaluationResult;
-import org.apache.beam.runners.spark.SparkRunner;
-import org.apache.beam.runners.spark.coders.WritableCoder;
-import org.apache.beam.runners.spark.examples.WordCount;
+import org.apache.beam.runners.spark.PipelineRule;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.coders.KvCoder;
-import org.apache.beam.sdk.options.PipelineOptions;
-import org.apache.beam.sdk.options.PipelineOptionsFactory;
-import org.apache.beam.sdk.transforms.DoFn;
-import org.apache.beam.sdk.transforms.MapElements;
-import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.io.hadoop.WritableCoder;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.IntWritable;
-import org.apache.hadoop.io.LongWritable;
 import org.apache.hadoop.io.SequenceFile;
 import org.apache.hadoop.io.SequenceFile.Reader;
 import org.apache.hadoop.io.SequenceFile.Writer;
@@ -61,6 +52,9 @@ public class HadoopFileFormatPipelineTest {
   private File outputFile;
 
   @Rule
+  public final PipelineRule pipelineRule = PipelineRule.batch();
+
+  @Rule
   public final TemporaryFolder tmpDir = new TemporaryFolder();
 
   @Before
@@ -74,46 +68,27 @@ public class HadoopFileFormatPipelineTest {
   public void testSequenceFile() throws Exception {
     populateFile();
 
-    PipelineOptions options = PipelineOptionsFactory.create();
-    options.setRunner(SparkRunner.class);
-    Pipeline p = Pipeline.create(options);
+    Pipeline p = pipelineRule.createPipeline();
     @SuppressWarnings("unchecked")
-    Class<? extends FileInputFormat<Text, LongWritable>> inputFormatClass =
-        (Class<? extends FileInputFormat<Text, LongWritable>>)
+    Class<? extends FileInputFormat<IntWritable, Text>> inputFormatClass =
+        (Class<? extends FileInputFormat<IntWritable, Text>>)
             (Class<?>) SequenceFileInputFormat.class;
-
-    HadoopIO.Read.Bound<Text, LongWritable> read =
+    HadoopIO.Read.Bound<IntWritable, Text> read =
         HadoopIO.Read.from(inputFile.getAbsolutePath(),
             inputFormatClass,
-            Text.class,
-            LongWritable.class);
-
-    PCollection<KV<Text, LongWritable>> input = p.apply(read)
-        .setCoder(KvCoder.of(WritableCoder.of(Text.class), WritableCoder.of(LongWritable.class)));
-
-
-    PCollection<KV<Text, LongWritable>> output = input.apply("test", ParDo.of(new DoFn<KV<Text, LongWritable>, KV<Text, LongWritable>>() {
-      @ProcessElement
-      public void processElement(ProcessContext c) {
-        for (String word : c.element().toString().split("[^a-zA-Z']+")) {
-          if (!word.isEmpty()) {
-            c.output(KV.of(new Text(word), new LongWritable(11)));
-          }
-        }
-      }
-    }));
-//        .apply(MapElements.via(new WordCount.FormatAsTextFn()));
-
+            IntWritable.class,
+            Text.class);
+    PCollection<KV<IntWritable, Text>> input = p.apply(read)
+        .setCoder(KvCoder.of(WritableCoder.of(IntWritable.class), WritableCoder.of(Text.class)));
     @SuppressWarnings("unchecked")
-    Class<? extends FileOutputFormat<Text, LongWritable>> outputFormatClass =
-        (Class<? extends FileOutputFormat<Text, LongWritable>>)
+    Class<? extends FileOutputFormat<IntWritable, Text>> outputFormatClass =
+        (Class<? extends FileOutputFormat<IntWritable, Text>>)
             (Class<?>) TemplatedSequenceFileOutputFormat.class;
     @SuppressWarnings("unchecked")
-    HadoopIO.Write.Bound<Text, LongWritable> write = HadoopIO.Write.to(outputFile.getAbsolutePath(),
-        outputFormatClass, Text.class, LongWritable.class);
+    HadoopIO.Write.Bound<IntWritable, Text> write = HadoopIO.Write.to(outputFile.getAbsolutePath(),
+        outputFormatClass, IntWritable.class, Text.class);
     input.apply(write.withoutSharding());
-    EvaluationResult res = (EvaluationResult) p.run();
-    res.close();
+    p.run().waitUntilFinish();
 
     IntWritable key = new IntWritable();
     Text value = new Text();

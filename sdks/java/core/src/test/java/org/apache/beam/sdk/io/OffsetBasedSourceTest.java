@@ -62,11 +62,6 @@ public class OffsetBasedSourceTest {
     }
 
     @Override
-    public boolean producesSortedKeys(PipelineOptions options) throws Exception {
-      return false;
-    }
-
-    @Override
     public void validate() {}
 
     @Override
@@ -85,7 +80,7 @@ public class OffsetBasedSourceTest {
     }
 
     @Override
-    public OffsetBasedReader<Integer> createReader(PipelineOptions options) throws IOException {
+    public CoarseRangeReader createReader(PipelineOptions options) {
       return new CoarseRangeReader(this);
     }
   }
@@ -105,7 +100,7 @@ public class OffsetBasedSourceTest {
     }
 
     @Override
-    public boolean startImpl() throws IOException {
+    public boolean startImpl() {
       current = getCurrentSource().getStartOffset();
       while (current % granularity != 0) {
         ++current;
@@ -114,7 +109,7 @@ public class OffsetBasedSourceTest {
     }
 
     @Override
-    public boolean advanceImpl() throws IOException {
+    public boolean advanceImpl() {
       ++current;
       return true;
     }
@@ -130,7 +125,7 @@ public class OffsetBasedSourceTest {
     }
 
     @Override
-    public void close() throws IOException { }
+    public void close() { }
   }
 
   public static void assertSplitsAre(List<? extends OffsetBasedSource<?>> splits,
@@ -211,7 +206,7 @@ public class OffsetBasedSourceTest {
     // in the face of that.
     PipelineOptions options = PipelineOptionsFactory.create();
     CoarseRangeSource source = new CoarseRangeSource(13, 35, 1, 10);
-    try (BoundedSource.BoundedReader<Integer> reader = source.createReader(options)) {
+    try (CoarseRangeReader reader = source.createReader(options)) {
       List<Integer> items = new ArrayList<>();
 
       assertEquals(0.0, reader.getFractionConsumed(), 1e-6);
@@ -304,7 +299,7 @@ public class OffsetBasedSourceTest {
   public void testSplitAtFraction() throws IOException {
     PipelineOptions options = PipelineOptionsFactory.create();
     CoarseRangeSource source = new CoarseRangeSource(13, 35, 1, 10);
-    try (CoarseRangeReader reader = (CoarseRangeReader) source.createReader(options)) {
+    try (CoarseRangeReader reader = source.createReader(options)) {
       List<Integer> originalItems = new ArrayList<>();
       assertTrue(reader.start());
       originalItems.add(reader.getCurrent());
@@ -340,5 +335,21 @@ public class OffsetBasedSourceTest {
     PipelineOptions options = PipelineOptionsFactory.create();
     CoarseRangeSource original = new CoarseRangeSource(13, 35, 1, 10);
     assertSplitAtFractionExhaustive(original, options);
+  }
+
+  @Test
+  public void testEmptyOffsetRange() throws Exception {
+    CoarseRangeSource empty = new CoarseRangeSource(0, 0, 1, 1);
+    try (CoarseRangeReader reader = empty.createReader(PipelineOptionsFactory.create())) {
+      assertEquals(0, reader.getSplitPointsConsumed());
+      assertEquals(OffsetBasedReader.SPLIT_POINTS_UNKNOWN, reader.getSplitPointsRemaining());
+      assertEquals(0.0, reader.getFractionConsumed(), 0.0001);
+
+      assertFalse(reader.start());
+
+      assertEquals(0, reader.getSplitPointsConsumed());
+      assertEquals(0, reader.getSplitPointsRemaining());
+      assertEquals(1.0, reader.getFractionConsumed(), 0.0001);
+    }
   }
 }

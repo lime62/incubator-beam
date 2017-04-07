@@ -35,13 +35,12 @@ import java.net.SocketTimeoutException;
 import java.util.List;
 import java.util.Map;
 import javax.annotation.Nullable;
-import org.apache.beam.runners.dataflow.internal.DataflowAggregatorTransforms;
-import org.apache.beam.runners.dataflow.internal.DataflowMetricUpdateExtractor;
 import org.apache.beam.runners.dataflow.options.DataflowPipelineOptions;
 import org.apache.beam.runners.dataflow.util.MonitoringUtil;
 import org.apache.beam.sdk.AggregatorRetrievalException;
 import org.apache.beam.sdk.AggregatorValues;
 import org.apache.beam.sdk.PipelineResult;
+import org.apache.beam.sdk.metrics.MetricResults;
 import org.apache.beam.sdk.transforms.Aggregator;
 import org.apache.beam.sdk.util.FluentBackoff;
 import org.joda.time.Duration;
@@ -61,15 +60,15 @@ public class DataflowPipelineJob implements PipelineResult {
   private String jobId;
 
   /**
-   * Google cloud project to associate this pipeline with.
+   * The {@link DataflowPipelineOptions} for the job.
    */
-  private String projectId;
+  private final DataflowPipelineOptions dataflowOptions;
 
   /**
    * Client for the Dataflow service. This can be used to query the service
    * for information about the job.
    */
-  private DataflowPipelineOptions dataflowOptions;
+  private final DataflowClient dataflowClient;
 
   /**
    * The state the job terminated in or {@code null} if the job has not terminated.
@@ -118,19 +117,17 @@ public class DataflowPipelineJob implements PipelineResult {
   /**
    * Constructs the job.
    *
-   * @param projectId the project id
    * @param jobId the job id
    * @param dataflowOptions used to configure the client for the Dataflow Service
    * @param aggregatorTransforms a mapping from aggregators to PTransforms
    */
   public DataflowPipelineJob(
-      String projectId,
       String jobId,
       DataflowPipelineOptions dataflowOptions,
       DataflowAggregatorTransforms aggregatorTransforms) {
-    this.projectId = projectId;
     this.jobId = jobId;
     this.dataflowOptions = dataflowOptions;
+    this.dataflowClient = (dataflowOptions == null ? null : DataflowClient.create(dataflowOptions));
     this.aggregatorTransforms = aggregatorTransforms;
   }
 
@@ -145,7 +142,7 @@ public class DataflowPipelineJob implements PipelineResult {
    * Get the project this job exists in.
    */
   public String getProjectId() {
-    return projectId;
+    return dataflowOptions.getProject();
   }
 
   /**
@@ -166,15 +163,24 @@ public class DataflowPipelineJob implements PipelineResult {
 
   @Override
   @Nullable
-  public State waitUntilFinish() throws IOException, InterruptedException {
+  public State waitUntilFinish() {
     return waitUntilFinish(Duration.millis(-1));
   }
 
   @Override
   @Nullable
-  public State waitUntilFinish(Duration duration)
-          throws IOException, InterruptedException {
-    return waitUntilFinish(duration, new MonitoringUtil.LoggingHandler());
+  public State waitUntilFinish(Duration duration) {
+    try {
+      return waitUntilFinish(duration, new MonitoringUtil.LoggingHandler());
+    } catch (Exception e) {
+      if (e instanceof InterruptedException) {
+        Thread.currentThread().interrupt();
+      }
+      if (e instanceof RuntimeException) {
+        throw (RuntimeException) e;
+      }
+      throw new RuntimeException(e);
+    }
   }
 
   /**
@@ -189,14 +195,32 @@ public class DataflowPipelineJob implements PipelineResult {
    *   thread is interrupted.
    * @throws IOException If there is a persistent problem getting job
    *   information.
-   * @throws InterruptedException
    */
   @Nullable
   @VisibleForTesting
   public State waitUntilFinish(
       Duration duration,
       MonitoringUtil.JobMessagesHandler messageHandler) throws IOException, InterruptedException {
-    return waitUntilFinish(duration, messageHandler, Sleeper.DEFAULT, NanoClock.SYSTEM);
+    // We ignore the potential race condition here (Ctrl-C after job submission but before the
+    // shutdown hook is registered). Even if we tried to do something smarter (eg., SettableFuture)
+    // the run method (which produces the job) could fail or be Ctrl-C'd before it had returned a
+    // job. The display of the command to cancel the job is best-effort anyways -- RPC's could fail,
+    // etc. If the user wants to verify the job was cancelled they should look at the job status.
+    Thread shutdownHook = new Thread() {
+      @Override
+      public void run() {
+        LOG.warn("Job is already running in Google Cloud Platform, Ctrl-C will not cancel it.\n"
+            + "To cancel the job in the cloud, run:\n> {}",
+            MonitoringUtil.getGcloudCancelCommand(dataflowOptions, getJobId()));
+      }
+    };
+
+    try {
+      Runtime.getRuntime().addShutdownHook(shutdownHook);
+      return waitUntilFinish(duration, messageHandler, Sleeper.DEFAULT, NanoClock.SYSTEM);
+    } finally {
+      Runtime.getRuntime().removeShutdownHook(shutdownHook);
+    }
   }
 
   /**
@@ -218,11 +242,10 @@ public class DataflowPipelineJob implements PipelineResult {
   @VisibleForTesting
   State waitUntilFinish(
       Duration duration,
-      MonitoringUtil.JobMessagesHandler messageHandler,
+      @Nullable MonitoringUtil.JobMessagesHandler messageHandler,
       Sleeper sleeper,
-      NanoClock nanoClock)
-          throws IOException, InterruptedException {
-    MonitoringUtil monitor = new MonitoringUtil(projectId, dataflowOptions.getDataflowClient());
+      NanoClock nanoClock) throws IOException, InterruptedException {
+    MonitoringUtil monitor = new MonitoringUtil(dataflowClient);
 
     long lastTimestamp = 0;
     BackOff backoff;
@@ -265,6 +288,23 @@ public class DataflowPipelineJob implements PipelineResult {
       if (!hasError) {
         // We can stop if the job is done.
         if (state.isTerminal()) {
+          switch (state) {
+            case DONE:
+            case CANCELLED:
+              LOG.info("Job {} finished with status {}.", getJobId(), state);
+              break;
+            case UPDATED:
+              LOG.info("Job {} has been updated and is running as the new job with id {}. "
+                  + "To access the updated job on the Dataflow monitoring console, "
+                  + "please navigate to {}",
+                  getJobId(),
+                  getReplacedByJob().getJobId(),
+                  MonitoringUtil.getJobMonitoringPageURL(
+                      getReplacedByJob().getProjectId(), getReplacedByJob().getJobId()));
+              break;
+            default:
+              LOG.info("Job {} failed with status {}.", getJobId(), state);
+          }
           return state;
         }
 
@@ -287,20 +327,18 @@ public class DataflowPipelineJob implements PipelineResult {
         }
       }
     } while(BackOffUtils.next(sleeper, backoff));
-    LOG.warn("No terminal state was returned.  State value {}", state);
+    LOG.warn("No terminal state was returned. State value {}", state);
     return null;  // Timed out.
   }
 
   @Override
   public State cancel() throws IOException {
     Job content = new Job();
-    content.setProjectId(projectId);
+    content.setProjectId(getProjectId());
     content.setId(jobId);
     content.setRequestedState("JOB_STATE_CANCELLED");
     try {
-      dataflowOptions.getDataflowClient().projects().jobs()
-          .update(projectId, jobId, content)
-          .execute();
+      dataflowClient.updateJob(jobId, content);
       return State.CANCELLED;
     } catch (IOException e) {
       State state = getState();
@@ -365,16 +403,12 @@ public class DataflowPipelineJob implements PipelineResult {
     // Retry loop ends in return or throw
     while (true) {
       try {
-        Job job = dataflowOptions.getDataflowClient()
-            .projects()
-            .jobs()
-            .get(projectId, jobId)
-            .execute();
+        Job job = dataflowClient.getJob(jobId);
         State currentState = MonitoringUtil.toState(job.getCurrentState());
         if (currentState.isTerminal()) {
           terminalState = currentState;
           replacedByJob = new DataflowPipelineJob(
-              getProjectId(), job.getReplacedByJobId(), dataflowOptions, aggregatorTransforms);
+              job.getReplacedByJobId(), dataflowOptions, aggregatorTransforms);
         }
         return job;
       } catch (IOException exn) {
@@ -426,6 +460,12 @@ public class DataflowPipelineJob implements PipelineResult {
     }
   }
 
+  @Override
+  public MetricResults metrics() {
+    throw new UnsupportedOperationException(
+        "The DataflowRunner does not currently support metrics.");
+  }
+
   private <OutputT> Map<String, OutputT> fromMetricUpdates(Aggregator<?, OutputT> aggregator)
       throws IOException {
     if (aggregatorTransforms.contains(aggregator)) {
@@ -434,8 +474,7 @@ public class DataflowPipelineJob implements PipelineResult {
         metricUpdates = terminalMetricUpdates;
       } else {
         boolean terminal = getState().isTerminal();
-        JobMetrics jobMetrics = dataflowOptions.getDataflowClient()
-            .projects().jobs().getMetrics(projectId, jobId).execute();
+        JobMetrics jobMetrics = dataflowClient.getJobMetrics(jobId);
         metricUpdates = jobMetrics.getMetrics();
         if (terminal && jobMetrics.getMetrics() != null) {
           terminalMetricUpdates = metricUpdates;

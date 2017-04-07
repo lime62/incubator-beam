@@ -18,18 +18,18 @@
 package org.apache.beam.runners.flink;
 
 import org.apache.beam.sdk.Pipeline;
+import org.apache.beam.sdk.Pipeline.PipelineExecutionException;
+import org.apache.beam.sdk.PipelineResult;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.options.PipelineOptionsValidator;
 import org.apache.beam.sdk.runners.PipelineRunner;
-import org.apache.beam.sdk.transforms.PTransform;
-import org.apache.beam.sdk.values.PInput;
-import org.apache.beam.sdk.values.POutput;
+import org.apache.beam.sdk.util.UserCodeException;
 
 /**
  * Test Flink runner.
  */
-public class TestFlinkRunner extends PipelineRunner<FlinkRunnerResult> {
+public class TestFlinkRunner extends PipelineRunner<PipelineResult> {
 
   private FlinkRunner delegate;
 
@@ -53,23 +53,22 @@ public class TestFlinkRunner extends PipelineRunner<FlinkRunnerResult> {
   }
 
   @Override
-  public <OutputT extends POutput, InputT extends PInput>
-      OutputT apply(PTransform<InputT, OutputT> transform, InputT input) {
-    return delegate.apply(transform, input);
-  }
-
-  @Override
-  public FlinkRunnerResult run(Pipeline pipeline) {
+  public PipelineResult run(Pipeline pipeline) {
     try {
-      FlinkRunnerResult result = delegate.run(pipeline);
-
-      return result;
+      return delegate.run(pipeline);
     } catch (Throwable e) {
       // Special case hack to pull out assertion errors from PAssert; instead there should
       // probably be a better story along the lines of UserCodeException.
       Throwable cause = e;
       Throwable oldCause = e;
+      PipelineExecutionException executionException = null;
       do {
+
+        // find UserCodeException and throw PipelineExecutionException
+        if (cause instanceof UserCodeException) {
+          executionException = new PipelineExecutionException(cause.getCause());
+        }
+
         if (cause.getCause() == null) {
           break;
         }
@@ -81,7 +80,11 @@ public class TestFlinkRunner extends PipelineRunner<FlinkRunnerResult> {
       if (cause instanceof AssertionError) {
         throw (AssertionError) cause;
       } else {
-        throw e;
+        if (executionException != null) {
+          throw executionException;
+        } else {
+          throw e;
+        }
       }
     }
   }

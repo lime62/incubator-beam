@@ -26,6 +26,7 @@ import java.util.UUID;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.io.CountingInput;
 import org.apache.beam.sdk.io.gcp.datastore.V1TestUtil.CreateEntityFn;
+import org.apache.beam.sdk.options.GcpOptions;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.testing.TestPipeline;
 import org.apache.beam.sdk.transforms.ParDo;
@@ -41,6 +42,7 @@ import org.junit.runners.JUnit4;
 @RunWith(JUnit4.class)
 public class V1WriteIT {
   private V1TestOptions options;
+  private String project;
   private String ancestor;
   private final long numEntities = 1000;
 
@@ -48,13 +50,14 @@ public class V1WriteIT {
   public void setup() {
     PipelineOptionsFactory.register(V1TestOptions.class);
     options = TestPipeline.testingPipelineOptions().as(V1TestOptions.class);
+    project = TestPipeline.testingPipelineOptions().as(GcpOptions.class).getProject();
     ancestor = UUID.randomUUID().toString();
   }
 
   /**
    * An end-to-end test for {@link DatastoreV1.Write}.
    *
-   * Write some test entities to datastore through a dataflow pipeline.
+   * <p>Write some test entities to Cloud Datastore.
    * Read and count all the entities. Verify that the count matches the
    * number of entities written.
    */
@@ -66,18 +69,18 @@ public class V1WriteIT {
     p.apply(CountingInput.upTo(numEntities))
         .apply(ParDo.of(new CreateEntityFn(
             options.getKind(), options.getNamespace(), ancestor)))
-        .apply(DatastoreIO.v1().write().withProjectId(options.getProject()));
+        .apply(DatastoreIO.v1().write().withProjectId(project));
 
     p.run();
 
     // Count number of entities written to datastore.
-    long numEntitiesWritten = countEntities(options, ancestor);
+    long numEntitiesWritten = countEntities(options, project, ancestor);
 
     assertEquals(numEntitiesWritten, numEntities);
   }
 
   @After
   public void tearDown() throws Exception {
-    deleteAllEntities(options, ancestor);
+    deleteAllEntities(options, project, ancestor);
   }
 }

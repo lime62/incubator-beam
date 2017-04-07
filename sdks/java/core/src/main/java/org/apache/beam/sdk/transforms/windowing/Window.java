@@ -22,6 +22,7 @@ import org.apache.beam.sdk.annotations.Experimental;
 import org.apache.beam.sdk.annotations.Experimental.Kind;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.Coder.NonDeterministicException;
+import org.apache.beam.sdk.transforms.Flatten;
 import org.apache.beam.sdk.transforms.GroupByKey;
 import org.apache.beam.sdk.transforms.MapElements;
 import org.apache.beam.sdk.transforms.PTransform;
@@ -30,6 +31,7 @@ import org.apache.beam.sdk.transforms.display.DisplayData;
 import org.apache.beam.sdk.util.WindowingStrategy;
 import org.apache.beam.sdk.util.WindowingStrategy.AccumulationMode;
 import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.PCollectionList;
 import org.joda.time.Duration;
 
 /**
@@ -40,11 +42,11 @@ import org.joda.time.Duration;
  * {@link org.apache.beam.sdk.transforms.GroupByKey GroupByKeys},
  * including one within composite transforms, will group by the combination of
  * keys and windows.
-
+ *
  * <p>See {@link org.apache.beam.sdk.transforms.GroupByKey}
  * for more information about how grouping with windows works.
  *
- * <h2> Windowing </h2>
+ * <h2>Windowing</h2>
  *
  * <p>Windowing a {@code PCollection} divides the elements into windows based
  * on the associated event time for each element. This is especially useful
@@ -58,13 +60,13 @@ import org.joda.time.Duration;
  * The following example demonstrates how to use {@code Window} in a pipeline
  * that counts the number of occurrences of strings each minute:
  *
- * <pre> {@code
+ * <pre>{@code
  * PCollection<String> items = ...;
  * PCollection<String> windowed_items = items.apply(
  *   Window.<String>into(FixedWindows.of(Duration.standardMinutes(1))));
  * PCollection<KV<String, Long>> windowed_counts = windowed_items.apply(
  *   Count.<String>perElement());
- * } </pre>
+ * }</pre>
  *
  * <p>Let (data, timestamp) denote a data element along with its timestamp.
  * Then, if the input to this pipeline consists of
@@ -83,7 +85,7 @@ import org.joda.time.Duration;
  * <p>Additionally, custom {@link WindowFn}s can be created, by creating new
  * subclasses of {@link WindowFn}.
  *
- * <h2> Triggers </h2>
+ * <h2>Triggers</h2>
  *
  * <p>{@link Window.Bound#triggering(Trigger)} allows specifying a trigger to control when
  * (in processing time) results for the given window can be produced. If unspecified, the default
@@ -103,7 +105,7 @@ import org.joda.time.Duration;
  * (The use of watermark time to stop processing tends to be more robust if the data source is slow
  * for a few days, etc.)
  *
- * <pre> {@code
+ * <pre>{@code
  * PCollection<String> items = ...;
  * PCollection<String> windowed_items = items.apply(
  *   Window.<String>into(FixedWindows.of(Duration.standardMinutes(1)))
@@ -114,21 +116,20 @@ import org.joda.time.Duration;
  *      .withAllowedLateness(Duration.standardDays(1)));
  * PCollection<KV<String, Long>> windowed_counts = windowed_items.apply(
  *   Count.<String>perElement());
- * } </pre>
+ * }</pre>
  *
  * <p>On the other hand, if we wanted to get early results every minute of processing
  * time (for which there were new elements in the given window) we could do the following:
  *
- * <pre> {@code
+ * <pre>{@code
  * PCollection<String> windowed_items = items.apply(
- *   Window.<String>into(FixedWindows.of(Duration.standardMinutes(1))
- *      .triggering(
+ *   Window.<String>into(FixedWindows.of(Duration.standardMinutes(1)))
  *      .triggering(
  *          AfterWatermark.pastEndOfWindow()
  *              .withEarlyFirings(AfterProcessingTime
  *                  .pastFirstElementInPane().plusDelayOf(Duration.standardMinutes(1))))
  *      .withAllowedLateness(Duration.ZERO));
- * } </pre>
+ * }</pre>
  *
  * <p>After a {@link org.apache.beam.sdk.transforms.GroupByKey} the trigger is set to
  * a trigger that will preserve the intent of the upstream trigger.  See
@@ -154,6 +155,7 @@ public class Window {
      * <p>This is the default behavior.
      */
     FIRE_IF_NON_EMPTY
+
   }
 
   /**
@@ -166,7 +168,7 @@ public class Window {
    * properties can be set on it first.
    */
   public static <T> Bound<T> into(WindowFn<? super T, ?> fn) {
-    return new Unbound().into(fn);
+    return new Bound(null).into(fn);
   }
 
   /**
@@ -179,7 +181,7 @@ public class Window {
    */
   @Experimental(Kind.TRIGGER)
   public static <T> Bound<T> triggering(Trigger trigger) {
-    return new Unbound().triggering(trigger);
+    return new Bound(null).triggering(trigger);
   }
 
   /**
@@ -191,7 +193,7 @@ public class Window {
    */
   @Experimental(Kind.TRIGGER)
   public static <T> Bound<T> discardingFiredPanes() {
-    return new Unbound().discardingFiredPanes();
+    return new Bound(null).discardingFiredPanes();
   }
 
   /**
@@ -203,7 +205,7 @@ public class Window {
    */
   @Experimental(Kind.TRIGGER)
   public static <T> Bound<T> accumulatingFiredPanes() {
-    return new Unbound().accumulatingFiredPanes();
+    return new Bound(null).accumulatingFiredPanes();
   }
 
   /**
@@ -219,125 +221,16 @@ public class Window {
    */
   @Experimental(Kind.TRIGGER)
   public static <T> Bound<T> withAllowedLateness(Duration allowedLateness) {
-    return new Unbound().withAllowedLateness(allowedLateness);
+    return new Bound(null).withAllowedLateness(allowedLateness);
   }
 
   /**
-   * Override the amount of lateness allowed for data elements in the output {@link PCollection},
-   * and downstream {@link PCollection PCollections} until explicitly set again. Like
-   * the other properties on this {@link Window} operation, this will be applied at
-   * the next {@link GroupByKey}. Any elements that are later than this as decided by
-   * the system-maintained watermark will be dropped.
-   *
-   * <p>This value also determines how long state will be kept around for old windows.
-   * Once no elements will be added to a window (because this duration has passed) any state
-   * associated with the window will be cleaned up.
+   * <b><i>(Experimental)</i></b> Override the default {@link OutputTimeFn}, to control
+   * the output timestamp of values output from a {@link GroupByKey} operation.
    */
-  @Experimental(Kind.TRIGGER)
-  public static <T> Bound<T> withAllowedLateness(
-      Duration allowedLateness, ClosingBehavior closingBehavior) {
-    return new Unbound().withAllowedLateness(allowedLateness, closingBehavior);
-  }
-
-  /**
-   * An incomplete {@code Window} transform, with unbound input/output type.
-   *
-   * <p>Before being applied, {@link Window.Unbound#into} must be
-   * invoked to specify the {@link WindowFn} to invoke, which will also
-   * bind the input/output type of this {@code PTransform}.
-   */
-  public static class Unbound {
-    String name;
-
-    Unbound() {}
-
-    Unbound(String name) {
-      this.name = name;
-    }
-
-    /**
-     * Returns a new {@code Window} {@code PTransform} that's like this
-     * transform but that will use the given {@link WindowFn}, and that has
-     * its input and output types bound.  Does not modify this transform.  The
-     * resulting {@code PTransform} is sufficiently specified to be applied,
-     * but more properties can still be specified.
-     */
-    public <T> Bound<T> into(WindowFn<? super T, ?> fn) {
-      return new Bound<T>(name).into(fn);
-    }
-
-    /**
-     * Sets a non-default trigger for this {@code Window} {@code PTransform}.
-     * Elements that are assigned to a specific window will be output when
-     * the trigger fires.
-     *
-     * <p>{@link org.apache.beam.sdk.transforms.windowing.Trigger}
-     * has more details on the available triggers.
-     *
-     * <p>Must also specify allowed lateness using {@link #withAllowedLateness} and accumulation
-     * mode using either {@link #discardingFiredPanes()} or {@link #accumulatingFiredPanes()}.
-     */
-    @Experimental(Kind.TRIGGER)
-    public <T> Bound<T> triggering(Trigger trigger) {
-      return new Bound<T>(name).triggering(trigger);
-    }
-
-    /**
-     * Returns a new {@code Window} {@code PTransform} that uses the registered WindowFn and
-     * Triggering behavior, and that discards elements in a pane after they are triggered.
-     *
-     * <p>Does not modify this transform.  The resulting {@code PTransform} is sufficiently
-     * specified to be applied, but more properties can still be specified.
-     */
-    @Experimental(Kind.TRIGGER)
-    public <T> Bound<T> discardingFiredPanes() {
-      return new Bound<T>(name).discardingFiredPanes();
-    }
-
-    /**
-     * Returns a new {@code Window} {@code PTransform} that uses the registered WindowFn and
-     * Triggering behavior, and that accumulates elements in a pane after they are triggered.
-     *
-     * <p>Does not modify this transform.  The resulting {@code PTransform} is sufficiently
-     * specified to be applied, but more properties can still be specified.
-     */
-    @Experimental(Kind.TRIGGER)
-    public <T> Bound<T> accumulatingFiredPanes() {
-      return new Bound<T>(name).accumulatingFiredPanes();
-    }
-
-    /**
-     * Override the amount of lateness allowed for data elements in the pipeline. Like
-     * the other properties on this {@link Window} operation, this will be applied at
-     * the next {@link GroupByKey}. Any elements that are later than this as decided by
-     * the system-maintained watermark will be dropped.
-     *
-     * <p>This value also determines how long state will be kept around for old windows.
-     * Once no elements will be added to a window (because this duration has passed) any state
-     * associated with the window will be cleaned up.
-     *
-     * <p>Depending on the trigger this may not produce a pane with {@link PaneInfo#isLast}. See
-     * {@link ClosingBehavior#FIRE_IF_NON_EMPTY} for more details.
-     */
-    @Experimental(Kind.TRIGGER)
-    public <T> Bound<T> withAllowedLateness(Duration allowedLateness) {
-      return new Bound<T>(name).withAllowedLateness(allowedLateness);
-    }
-
-    /**
-     * Override the amount of lateness allowed for data elements in the pipeline. Like
-     * the other properties on this {@link Window} operation, this will be applied at
-     * the next {@link GroupByKey}. Any elements that are later than this as decided by
-     * the system-maintained watermark will be dropped.
-     *
-     * <p>This value also determines how long state will be kept around for old windows.
-     * Once no elements will be added to a window (because this duration has passed) any state
-     * associated with the window will be cleaned up.
-     */
-    @Experimental(Kind.TRIGGER)
-    public <T> Bound<T> withAllowedLateness(Duration allowedLateness, ClosingBehavior behavior) {
-      return new Bound<T>(name).withAllowedLateness(allowedLateness, behavior);
-    }
+  @Experimental(Kind.OUTPUT_TIME)
+  public static <T> Bound<T> withOutputTimeFn(OutputTimeFn<?> outputTimeFn) {
+    return new Bound(null).withOutputTimeFn(outputTimeFn);
   }
 
   /**
@@ -544,30 +437,50 @@ public class Window {
 
       // Make sure that the windowing strategy is complete & valid.
       if (outputStrategy.isTriggerSpecified()
-          && !(outputStrategy.getTrigger().getSpec() instanceof DefaultTrigger)) {
-        if (!(outputStrategy.getWindowFn() instanceof GlobalWindows)
-            && !outputStrategy.isAllowedLatenessSpecified()) {
-          throw new IllegalArgumentException("Except when using GlobalWindows,"
-              + " calling .triggering() to specify a trigger requires that the allowed lateness be"
-              + " specified using .withAllowedLateness() to set the upper bound on how late data"
-              + " can arrive before being dropped. See Javadoc for more details.");
-        }
+          && !(outputStrategy.getTrigger() instanceof DefaultTrigger)
+          && !(outputStrategy.getWindowFn() instanceof GlobalWindows)
+          && !outputStrategy.isAllowedLatenessSpecified()) {
+        throw new IllegalArgumentException(
+            "Except when using GlobalWindows,"
+                + " calling .triggering() to specify a trigger requires that the allowed lateness"
+                + " be specified using .withAllowedLateness() to set the upper bound on how late"
+                + " data can arrive before being dropped. See Javadoc for more details.");
+      }
 
-        if (!outputStrategy.isModeSpecified()) {
-          throw new IllegalArgumentException(
-              "Calling .triggering() to specify a trigger requires that the accumulation mode be"
-              + " specified using .discardingFiredPanes() or .accumulatingFiredPanes()."
-              + " See Javadoc for more details.");
-        }
+      if (!outputStrategy.isModeSpecified() && canProduceMultiplePanes(outputStrategy)) {
+        throw new IllegalArgumentException(
+            "Calling .triggering() to specify a trigger or calling .withAllowedLateness() to"
+                + " specify an allowed lateness greater than zero requires that the accumulation"
+                + " mode be specified using .discardingFiredPanes() or .accumulatingFiredPanes()."
+                + " See Javadoc for more details.");
       }
     }
 
+    private boolean canProduceMultiplePanes(WindowingStrategy<?, ?> strategy) {
+      // The default trigger is Repeatedly.forever(AfterWatermark.pastEndOfWindow()); This fires
+      // for every late-arriving element if allowed lateness is nonzero, and thus we must have
+      // an accumulating mode specified
+      boolean dataCanArriveLate =
+          !(strategy.getWindowFn() instanceof GlobalWindows)
+              && strategy.getAllowedLateness().getMillis() > 0;
+      boolean hasCustomTrigger = !(strategy.getTrigger() instanceof DefaultTrigger);
+      return dataCanArriveLate || hasCustomTrigger;
+    }
+
     @Override
-    public PCollection<T> apply(PCollection<T> input) {
+    public PCollection<T> expand(PCollection<T> input) {
       WindowingStrategy<?, ?> outputStrategy =
           getOutputStrategyInternal(input.getWindowingStrategy());
-      return PCollection.createPrimitiveOutputInternal(
-          input.getPipeline(), outputStrategy, input.isBounded());
+      if (windowFn == null) {
+        // A new PCollection must be created in case input is reused in a different location as the
+        // two PCollections will, in general, have a different windowing strategy.
+        return PCollectionList.of(input)
+            .apply(Flatten.<T>pCollections())
+            .setWindowingStrategyInternal(outputStrategy);
+      } else {
+        // This is the AssignWindows primitive
+        return input.apply(new Assign<T>(outputStrategy));
+      }
     }
 
     @Override
@@ -578,7 +491,7 @@ public class Window {
         builder
             .add(DisplayData.item("windowFn", windowFn.getClass())
               .withLabel("Windowing Function"))
-            .include(windowFn);
+            .include("windowFn", windowFn);
       }
 
       if (allowedLateness != null) {
@@ -619,6 +532,33 @@ public class Window {
     }
   }
 
+
+  /**
+   * A Primitive {@link PTransform} that assigns windows to elements based on a {@link WindowFn}.
+   */
+  public static class Assign<T> extends PTransform<PCollection<T>, PCollection<T>> {
+    private final WindowingStrategy<T, ?> updatedStrategy;
+
+    /**
+     * Create a new {@link Assign} where the output is windowed with the updated {@link
+     * WindowingStrategy}. Windows should be assigned using the {@link WindowFn} returned by
+     * {@link #getWindowFn()}.
+     */
+    private Assign(WindowingStrategy updatedStrategy) {
+      this.updatedStrategy = updatedStrategy;
+    }
+
+    @Override
+    public PCollection<T> expand(PCollection<T> input) {
+      return PCollection.createPrimitiveOutputInternal(
+          input.getPipeline(), updatedStrategy, input.isBounded());
+    }
+
+    public WindowFn<T, ?> getWindowFn() {
+      return updatedStrategy.getWindowFn();
+    }
+  }
+
   /**
    * Creates a {@code Window} {@code PTransform} that does not change assigned
    * windows, but will cause windows to be merged again as part of the next
@@ -635,7 +575,7 @@ public class Window {
    */
   private static class Remerge<T> extends PTransform<PCollection<T>, PCollection<T>> {
     @Override
-    public PCollection<T> apply(PCollection<T> input) {
+    public PCollection<T> expand(PCollection<T> input) {
       WindowingStrategy<?, ?> outputWindowingStrategy = getOutputWindowing(
           input.getWindowingStrategy());
 

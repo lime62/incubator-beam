@@ -21,18 +21,14 @@ import static com.google.common.base.Preconditions.checkArgument;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
-import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.google.common.collect.Multimap;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.Serializable;
-import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -67,7 +63,7 @@ public class CombineFns {
    * <p>The same {@link TupleTag} cannot be used in a composition multiple times.
    *
    * <p>Example:
-   * <pre><code>
+   * <pre>{@code
    * PCollection<KV<K, Integer>> latencies = ...;
    *
    * TupleTag<Integer> maxLatencyTag = new TupleTag<Integer>();
@@ -97,7 +93,7 @@ public class CombineFns {
    *             c.output(...some T...);
    *           }
    *         }));
-   * </code></pre>
+   * }</pre>
    */
   public static ComposeKeyedCombineFnBuilder composeKeyed() {
     return new ComposeKeyedCombineFnBuilder();
@@ -110,7 +106,7 @@ public class CombineFns {
    * <p>The same {@link TupleTag} cannot be used in a composition multiple times.
    *
    * <p>Example:
-   * <pre><code>
+   * <pre>{@code
    * PCollection<Integer> globalLatencies = ...;
    *
    * TupleTag<Integer> maxLatencyTag = new TupleTag<Integer>();
@@ -118,7 +114,7 @@ public class CombineFns {
    *
    * SimpleFunction<Integer, Integer> identityFn =
    *     new SimpleFunction<Integer, Integer>() {
-   *       @Override
+   *       {@literal @}Override
    *       public Integer apply(Integer input) {
    *           return input;
    *       }};
@@ -140,7 +136,7 @@ public class CombineFns {
    *             c.output(...some T...);
    *           }
    *         }));
-   * </code></pre>
+   * }</pre>
    */
   public static ComposeCombineFnBuilder compose() {
     return new ComposeCombineFnBuilder();
@@ -998,20 +994,30 @@ public class CombineFns {
     public void encode(Object[] value, OutputStream outStream, Context context)
         throws CoderException, IOException {
       checkArgument(value.length == codersCount);
+      if (value.length == 0) {
+        return;
+      }
+      int lastIndex = codersCount - 1;
       Context nestedContext = context.nested();
-      for (int i = 0; i < codersCount; ++i) {
+      for (int i = 0; i < lastIndex; ++i) {
         coders.get(i).encode(value[i], outStream, nestedContext);
       }
+      coders.get(lastIndex).encode(value[lastIndex], outStream, context);
     }
 
     @Override
     public Object[] decode(InputStream inStream, Context context)
         throws CoderException, IOException {
       Object[] ret = new Object[codersCount];
+      if (codersCount == 0) {
+        return ret;
+      }
+      int lastIndex = codersCount - 1;
       Context nestedContext = context.nested();
-      for (int i = 0; i < codersCount; ++i) {
+      for (int i = 0; i < lastIndex; ++i) {
         ret[i] = coders.get(i).decode(inStream, nestedContext);
       }
+      ret[lastIndex] = coders.get(lastIndex).decode(inStream, context);
       return ret;
     }
 
@@ -1044,35 +1050,12 @@ public class CombineFns {
    */
   private static void populateDisplayData(
       DisplayData.Builder builder, List<? extends HasDisplayData> combineFns) {
-
-    // NB: ArrayListMultimap necessary to maintain ordering of combineFns of the same type.
-    Multimap<Class<?>, HasDisplayData> combineFnMap = ArrayListMultimap.create();
-
     for (int i = 0; i < combineFns.size(); i++) {
       HasDisplayData combineFn = combineFns.get(i);
-      builder.add(DisplayData.item("combineFn" + (i + 1), combineFn.getClass())
+      String token = "combineFn" + (i + 1);
+      builder.add(DisplayData.item(token, combineFn.getClass())
         .withLabel("Combine Function"));
-      combineFnMap.put(combineFn.getClass(), combineFn);
-    }
-
-    for (Map.Entry<Class<?>, Collection<HasDisplayData>> combineFnEntries :
-        combineFnMap.asMap().entrySet()) {
-
-      Collection<HasDisplayData> classCombineFns = combineFnEntries.getValue();
-      if (classCombineFns.size() == 1) {
-        // Only one combineFn of this type, include it directly.
-        builder.include(Iterables.getOnlyElement(classCombineFns));
-
-      } else {
-        // Multiple combineFns of same type, add a namespace suffix so display data is
-        // unique and ordered.
-        String baseNamespace = combineFnEntries.getKey().getName();
-        for (int i = 0; i < combineFns.size(); i++) {
-          HasDisplayData combineFn = combineFns.get(i);
-          String namespace = String.format("%s#%d", baseNamespace, i + 1);
-          builder.include(combineFn, namespace);
-        }
-      }
+      builder.include(token, combineFn);
     }
   }
 }

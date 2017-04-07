@@ -18,17 +18,19 @@
 
 package org.apache.beam.runners.spark.translation.streaming;
 
-import com.google.common.base.Predicates;
-import com.google.common.collect.Iterables;
-import java.net.MalformedURLException;
-import java.net.URL;
-import java.util.Arrays;
+import static com.google.common.base.Preconditions.checkArgument;
+
+import java.io.IOException;
 import org.apache.beam.runners.spark.SparkPipelineOptions;
 import org.apache.beam.runners.spark.SparkRunner;
+import org.apache.beam.runners.spark.translation.EvaluationContext;
 import org.apache.beam.runners.spark.translation.SparkContextFactory;
 import org.apache.beam.runners.spark.translation.SparkPipelineTranslator;
 import org.apache.beam.runners.spark.translation.TransformTranslator;
+import org.apache.beam.runners.spark.translation.streaming.Checkpoint.CheckpointDir;
 import org.apache.beam.sdk.Pipeline;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.streaming.Duration;
 import org.apache.spark.streaming.api.java.JavaStreamingContext;
@@ -39,26 +41,35 @@ import org.slf4j.LoggerFactory;
 
 /**
  * A {@link JavaStreamingContext} factory for resilience.
- * @see <a href="https://spark.apache.org/docs/1.6.2/streaming-programming-guide.html#how-to-configure-checkpointing">how-to-configure-checkpointing</a>
+ * @see <a href="https://spark.apache.org/docs/1.6.3/streaming-programming-guide.html#how-to-configure-checkpointing">how-to-configure-checkpointing</a>
  */
 public class SparkRunnerStreamingContextFactory implements JavaStreamingContextFactory {
   private static final Logger LOG =
       LoggerFactory.getLogger(SparkRunnerStreamingContextFactory.class);
-  private static final Iterable<String> KNOWN_RELIABLE_FS = Arrays.asList("hdfs", "s3", "gs");
 
   private final Pipeline pipeline;
   private final SparkPipelineOptions options;
+  private final CheckpointDir checkpointDir;
 
-  public SparkRunnerStreamingContextFactory(Pipeline pipeline, SparkPipelineOptions options) {
+  public SparkRunnerStreamingContextFactory(
+      Pipeline pipeline,
+      SparkPipelineOptions options,
+      CheckpointDir checkpointDir) {
     this.pipeline = pipeline;
     this.options = options;
+    this.checkpointDir = checkpointDir;
   }
 
-  private StreamingEvaluationContext ctxt;
+  private EvaluationContext ctxt;
 
   @Override
   public JavaStreamingContext create() {
     LOG.info("Creating a new Spark Streaming Context");
+    // validate unbounded read properties.
+    checkArgument(options.getMinReadTimeMillis() < options.getBatchIntervalMillis(),
+        "Minimum read time has to be less than batch time.");
+    checkArgument(options.getReadTimePercentage() > 0 && options.getReadTimePercentage() < 1,
+        "Read time percentage is bound to (0, 1).");
 
     SparkPipelineTranslator translator = new StreamingTransformTranslator.Translator(
         new TransformTranslator.Translator());
@@ -67,32 +78,36 @@ public class SparkRunnerStreamingContextFactory implements JavaStreamingContextF
 
     JavaSparkContext jsc = SparkContextFactory.getSparkContext(options);
     JavaStreamingContext jssc = new JavaStreamingContext(jsc, batchDuration);
-    ctxt = new StreamingEvaluationContext(jsc, pipeline, jssc,
-        options.getTimeout());
+
+    ctxt = new EvaluationContext(jsc, pipeline, jssc);
     pipeline.traverseTopologically(new SparkRunner.Evaluator(translator, ctxt));
     ctxt.computeOutputs();
 
-    // set checkpoint dir.
-    String checkpointDir = options.getCheckpointDir();
-    LOG.info("Checkpoint dir set to: {}", checkpointDir);
-    try {
-      // validate checkpoint dir and warn if not of a known durable filesystem.
-      URL checkpointDirUrl = new URL(checkpointDir);
-      if (!Iterables.any(KNOWN_RELIABLE_FS, Predicates.equalTo(checkpointDirUrl.getProtocol()))) {
-        LOG.warn("Checkpoint dir URL {} does not match a reliable filesystem, in case of failures "
-            + "this job may not recover properly or even at all.", checkpointDirUrl);
-      }
-    } catch (MalformedURLException e) {
-      throw new RuntimeException("Failed to form checkpoint dir URL. CheckpointDir should be in "
-          + "the form of hdfs:///path/to/dir or other reliable fs protocol, "
-              + "or file:///path/to/dir for local mode.", e);
-    }
-    jssc.checkpoint(checkpointDir);
+    checkpoint(jssc);
 
     return jssc;
   }
 
-  public StreamingEvaluationContext getCtxt() {
-    return ctxt;
+  private void checkpoint(JavaStreamingContext jssc) {
+    Path rootCheckpointPath = checkpointDir.getRootCheckpointDir();
+    Path sparkCheckpointPath = checkpointDir.getSparkCheckpointDir();
+    Path beamCheckpointPath = checkpointDir.getBeamCheckpointDir();
+
+    try {
+      FileSystem fileSystem = rootCheckpointPath.getFileSystem(jssc.sc().hadoopConfiguration());
+      if (!fileSystem.exists(rootCheckpointPath)) {
+        fileSystem.mkdirs(rootCheckpointPath);
+      }
+      if (!fileSystem.exists(sparkCheckpointPath)) {
+        fileSystem.mkdirs(sparkCheckpointPath);
+      }
+      if (!fileSystem.exists(beamCheckpointPath)) {
+        fileSystem.mkdirs(beamCheckpointPath);
+      }
+    } catch (IOException e) {
+      throw new RuntimeException("Failed to create checkpoint dir", e);
+    }
+
+    jssc.checkpoint(sparkCheckpointPath.toString());
   }
 }

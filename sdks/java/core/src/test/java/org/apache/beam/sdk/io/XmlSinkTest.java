@@ -19,6 +19,7 @@ package org.apache.beam.sdk.io;
 
 import static org.apache.beam.sdk.transforms.display.DisplayDataMatchers.hasDisplayItem;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.containsString;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 
@@ -28,6 +29,7 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.nio.channels.WritableByteChannel;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -59,7 +61,7 @@ public class XmlSinkTest {
 
   private Class<Bird> testClass = Bird.class;
   private String testRootElement = "testElement";
-  private String testFilePrefix = "testPrefix";
+  private String testFilePrefix = "/path/to/testPrefix";
 
   /**
    * An XmlWriter correctly writes objects as Xml elements with an enclosing root element.
@@ -91,7 +93,7 @@ public class XmlSinkTest {
             .withRootElement(testRootElement);
     assertEquals(testClass, sink.classToBind);
     assertEquals(testRootElement, sink.rootElementName);
-    assertEquals(testFilePrefix, sink.baseOutputFilename);
+    assertEquals(testFilePrefix, sink.baseOutputFilename.get());
   }
 
   /**
@@ -103,7 +105,7 @@ public class XmlSinkTest {
         XmlSink.writeOf(Bird.class, testRootElement, testFilePrefix);
     assertEquals(testClass, sink.classToBind);
     assertEquals(testRootElement, sink.rootElementName);
-    assertEquals(testFilePrefix, sink.baseOutputFilename);
+    assertEquals(testFilePrefix, sink.baseOutputFilename.get());
   }
 
   /**
@@ -140,10 +142,14 @@ public class XmlSinkTest {
         XmlSink.writeOf(testClass, testRootElement, testFilePrefix);
     XmlWriteOperation<Bird> writeOp = sink.createWriteOperation(options);
     assertEquals(testClass, writeOp.getSink().classToBind);
-    assertEquals(testFilePrefix, writeOp.getSink().baseOutputFilename);
+    assertEquals(testFilePrefix, writeOp.getSink().baseOutputFilename.get());
     assertEquals(testRootElement, writeOp.getSink().rootElementName);
     assertEquals(XmlSink.XML_EXTENSION, writeOp.getSink().extension);
-    assertEquals(testFilePrefix, writeOp.baseTemporaryFilename);
+    Path outputPath = new File(testFilePrefix).toPath();
+    Path tempPath = new File(writeOp.tempDirectory.get()).toPath();
+    assertEquals(outputPath.getParent(), tempPath.getParent());
+    assertThat(
+        tempPath.getFileName().toString(), containsString("temp-beam-" + outputPath.getFileName()));
   }
 
   /**
@@ -156,7 +162,11 @@ public class XmlSinkTest {
         XmlSink.writeOf(testClass, testRootElement, testFilePrefix)
             .createWriteOperation(options);
     XmlWriter<Bird> writer = writeOp.createWriter(options);
-    assertEquals(testFilePrefix, writer.getWriteOperation().baseTemporaryFilename);
+    Path outputPath = new File(testFilePrefix).toPath();
+    Path tempPath = new File(writer.getWriteOperation().tempDirectory.get()).toPath();
+    assertEquals(outputPath.getParent(), tempPath.getParent());
+    assertThat(
+        tempPath.getFileName().toString(), containsString("temp-beam-" + outputPath.getFileName()));
     assertEquals(testRootElement, writer.getWriteOperation().getSink().rootElementName);
     assertNotNull(writer.marshaller);
   }

@@ -25,6 +25,8 @@ import static org.mockito.Mockito.when;
 import com.google.common.collect.HashMultiset;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Multiset;
+import org.apache.beam.runners.core.KeyedWorkItem;
+import org.apache.beam.runners.core.KeyedWorkItems;
 import org.apache.beam.runners.direct.DirectGroupByKey.DirectGroupByKeyOnly;
 import org.apache.beam.runners.direct.DirectRunner.CommittedBundle;
 import org.apache.beam.runners.direct.DirectRunner.UncommittedBundle;
@@ -33,15 +35,13 @@ import org.apache.beam.sdk.coders.KvCoder;
 import org.apache.beam.sdk.coders.StringUtf8Coder;
 import org.apache.beam.sdk.testing.TestPipeline;
 import org.apache.beam.sdk.transforms.Create;
-import org.apache.beam.sdk.util.KeyedWorkItem;
-import org.apache.beam.sdk.util.KeyedWorkItems;
-import org.apache.beam.sdk.util.ReifyTimestampsAndWindows;
 import org.apache.beam.sdk.util.WindowedValue;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.hamcrest.BaseMatcher;
 import org.hamcrest.Description;
 import org.joda.time.Instant;
+import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
@@ -53,9 +53,11 @@ import org.junit.runners.JUnit4;
 public class GroupByKeyEvaluatorFactoryTest {
   private BundleFactory bundleFactory = ImmutableListBundleFactory.create();
 
+  @Rule
+  public TestPipeline p = TestPipeline.create().enableAbandonedNodeEnforcement(false);
+
   @Test
   public void testInMemoryEvaluator() throws Exception {
-    TestPipeline p = TestPipeline.create();
     KV<String, Integer> firstFoo = KV.of("foo", -1);
     KV<String, Integer> secondFoo = KV.of("foo", 1);
     KV<String, Integer> thirdFoo = KV.of("foo", 3);
@@ -64,13 +66,11 @@ public class GroupByKeyEvaluatorFactoryTest {
     KV<String, Integer> firstBaz = KV.of("baz", Integer.MAX_VALUE);
     PCollection<KV<String, Integer>> values =
         p.apply(Create.of(firstFoo, firstBar, secondFoo, firstBaz, secondBar, thirdFoo));
-    PCollection<KV<String, WindowedValue<Integer>>> kvs =
-        values.apply(new ReifyTimestampsAndWindows<String, Integer>());
     PCollection<KeyedWorkItem<String, Integer>> groupedKvs =
-        kvs.apply(new DirectGroupByKeyOnly<String, Integer>());
+        values.apply(new DirectGroupByKeyOnly<String, Integer>());
 
-    CommittedBundle<KV<String, WindowedValue<Integer>>> inputBundle =
-        bundleFactory.createBundle(kvs).commit(Instant.now());
+    CommittedBundle<KV<String, Integer>> inputBundle =
+        bundleFactory.createBundle(values).commit(Instant.now());
     EvaluationContext evaluationContext = mock(EvaluationContext.class);
     StructuralKey<String> fooKey = StructuralKey.of("foo", StringUtf8Coder.of());
     UncommittedBundle<KeyedWorkItem<String, Integer>> fooBundle =
@@ -97,17 +97,17 @@ public class GroupByKeyEvaluatorFactoryTest {
     // The input to a GroupByKey is assumed to be a KvCoder
     @SuppressWarnings("unchecked")
     Coder<String> keyCoder =
-        ((KvCoder<String, WindowedValue<Integer>>) kvs.getCoder()).getKeyCoder();
-    TransformEvaluator<KV<String, WindowedValue<Integer>>> evaluator =
+        ((KvCoder<String, Integer>) values.getCoder()).getKeyCoder();
+    TransformEvaluator<KV<String, Integer>> evaluator =
         new GroupByKeyOnlyEvaluatorFactory(evaluationContext)
-            .forApplication(groupedKvs.getProducingTransformInternal(), inputBundle);
+            .forApplication(DirectGraphs.getProducer(groupedKvs), inputBundle);
 
-    evaluator.processElement(WindowedValue.valueInEmptyWindows(gwValue(firstFoo)));
-    evaluator.processElement(WindowedValue.valueInEmptyWindows(gwValue(secondFoo)));
-    evaluator.processElement(WindowedValue.valueInEmptyWindows(gwValue(thirdFoo)));
-    evaluator.processElement(WindowedValue.valueInEmptyWindows(gwValue(firstBar)));
-    evaluator.processElement(WindowedValue.valueInEmptyWindows(gwValue(secondBar)));
-    evaluator.processElement(WindowedValue.valueInEmptyWindows(gwValue(firstBaz)));
+    evaluator.processElement(WindowedValue.valueInGlobalWindow(firstFoo));
+    evaluator.processElement(WindowedValue.valueInGlobalWindow(secondFoo));
+    evaluator.processElement(WindowedValue.valueInGlobalWindow(thirdFoo));
+    evaluator.processElement(WindowedValue.valueInGlobalWindow(firstBar));
+    evaluator.processElement(WindowedValue.valueInGlobalWindow(secondBar));
+    evaluator.processElement(WindowedValue.valueInGlobalWindow(firstBaz));
 
     evaluator.finishBundle();
 
@@ -140,10 +140,6 @@ public class GroupByKeyEvaluatorFactoryTest {
                     "baz",
                     ImmutableSet.of(WindowedValue.valueInGlobalWindow(Integer.MAX_VALUE))),
                 keyCoder)));
-  }
-
-  private <K, V> KV<K, WindowedValue<V>> gwValue(KV<K, V> kv) {
-    return KV.of(kv.getKey(), WindowedValue.valueInGlobalWindow(kv.getValue()));
   }
 
   private static class KeyedWorkItemMatcher<K, V>

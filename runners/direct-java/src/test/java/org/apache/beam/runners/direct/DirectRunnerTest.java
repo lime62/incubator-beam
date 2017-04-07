@@ -17,13 +17,17 @@
  */
 package org.apache.beam.runners.direct;
 
+import static com.google.common.base.Preconditions.checkState;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.isA;
 import static org.junit.Assert.assertThat;
 import static org.junit.Assert.fail;
 
-import com.fasterxml.jackson.annotation.JsonValue;
 import com.google.common.collect.ImmutableMap;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.Serializable;
 import java.util.Arrays;
 import java.util.List;
@@ -31,9 +35,16 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.beam.runners.direct.DirectRunner.DirectPipelineResult;
 import org.apache.beam.sdk.Pipeline;
+import org.apache.beam.sdk.coders.AtomicCoder;
+import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.CoderException;
 import org.apache.beam.sdk.coders.ListCoder;
 import org.apache.beam.sdk.coders.VarIntCoder;
+import org.apache.beam.sdk.coders.VarLongCoder;
+import org.apache.beam.sdk.io.BoundedSource;
+import org.apache.beam.sdk.io.CountingInput;
+import org.apache.beam.sdk.io.CountingSource;
+import org.apache.beam.sdk.io.Read;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.runners.PipelineRunner;
@@ -43,7 +54,6 @@ import org.apache.beam.sdk.transforms.Create;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.Flatten;
 import org.apache.beam.sdk.transforms.MapElements;
-import org.apache.beam.sdk.transforms.OldDoFn;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.transforms.SerializableFunction;
 import org.apache.beam.sdk.transforms.SimpleFunction;
@@ -73,8 +83,7 @@ public class DirectRunnerTest implements Serializable {
     PipelineOptions opts = PipelineOptionsFactory.create();
     opts.setRunner(DirectRunner.class);
 
-    Pipeline p = Pipeline.create(opts);
-    return p;
+    return Pipeline.create(opts);
   }
 
   @Test
@@ -109,7 +118,7 @@ public class DirectRunnerTest implements Serializable {
     PAssert.that(countStrs).containsInAnyOrder("baz: 1", "bar: 2", "foo: 3");
 
     DirectPipelineResult result = ((DirectPipelineResult) p.run());
-    result.awaitCompletion();
+    result.waitUntilFinish();
   }
 
   private static AtomicInteger changed;
@@ -147,10 +156,10 @@ public class DirectRunnerTest implements Serializable {
     PAssert.that(countStrs).containsInAnyOrder("baz: 1", "bar: 2", "foo: 3");
 
     DirectPipelineResult result = ((DirectPipelineResult) p.run());
-    result.awaitCompletion();
+    result.waitUntilFinish();
 
     DirectPipelineResult otherResult = ((DirectPipelineResult) p.run());
-    otherResult.awaitCompletion();
+    otherResult.waitUntilFinish();
 
     assertThat("Each element should have been processed twice", changed.get(), equalTo(6));
   }
@@ -204,9 +213,18 @@ public class DirectRunnerTest implements Serializable {
   }
 
   @Test
+  public void splitsInputs() {
+    Pipeline p = getPipeline();
+    PCollection<Long> longs = p.apply(Read.from(MustSplitSource.of(CountingSource.upTo(3))));
+
+    PAssert.that(longs).containsInAnyOrder(0L, 1L, 2L);
+    p.run();
+  }
+
+  @Test
   public void transformDisplayDataExceptionShouldFail() {
-    OldDoFn<Integer, Integer> brokenDoFn = new OldDoFn<Integer, Integer>() {
-      @Override
+    DoFn<Integer, Integer> brokenDoFn = new DoFn<Integer, Integer>() {
+      @ProcessElement
       public void processElement(ProcessContext c) throws Exception {}
 
       @Override
@@ -225,39 +243,8 @@ public class DirectRunnerTest implements Serializable {
     p.run();
   }
 
-  @Test
-  public void pipelineOptionsDisplayDataExceptionShouldFail() {
-    Object brokenValueType = new Object() {
-      @JsonValue
-      public int getValue () {
-        return 42;
-      }
-
-      @Override
-      public String toString() {
-        throw new RuntimeException("oh noes!!");
-      }
-    };
-
-    Pipeline p = getPipeline();
-    p.getOptions().as(ObjectPipelineOptions.class).setValue(brokenValueType);
-
-    p.apply(Create.of(1, 2, 3));
-
-    thrown.expectMessage(PipelineOptions.class.getName());
-    thrown.expectCause(ThrowableMessageMatcher.hasMessage(is("oh noes!!")));
-    p.run();
-  }
-
-  /** {@link PipelineOptions} to inject bad object implementations. */
-  public interface ObjectPipelineOptions extends PipelineOptions {
-    Object getValue();
-    void setValue(Object value);
-  }
-
-
   /**
-   * Tests that a {@link OldDoFn} that mutates an output with a good equals() fails in the
+   * Tests that a {@link DoFn} that mutates an output with a good equals() fails in the
    * {@link DirectRunner}.
    */
   @Test
@@ -266,8 +253,9 @@ public class DirectRunnerTest implements Serializable {
 
     pipeline
         .apply(Create.of(42))
-        .apply(ParDo.of(new OldDoFn<Integer, List<Integer>>() {
-          @Override public void processElement(ProcessContext c) {
+        .apply(ParDo.of(new DoFn<Integer, List<Integer>>() {
+          @ProcessElement
+          public void processElement(ProcessContext c) {
             List<Integer> outputList = Arrays.asList(1, 2, 3, 4);
             c.output(outputList);
             outputList.set(0, 37);
@@ -282,7 +270,33 @@ public class DirectRunnerTest implements Serializable {
   }
 
   /**
-   * Tests that a {@link OldDoFn} that mutates an output with a good equals() fails in the
+   * Tests that a {@link DoFn} that mutates an output with a good equals() fails in the
+   * {@link DirectRunner}.
+   */
+  @Test
+  public void testMutatingOutputWithEnforcementDisabledSucceeds() throws Exception {
+    PipelineOptions options = PipelineOptionsFactory.create();
+    options.setRunner(DirectRunner.class);
+    options.as(DirectOptions.class).setEnforceImmutability(false);
+    Pipeline pipeline = Pipeline.create(options);
+
+    pipeline
+        .apply(Create.of(42))
+        .apply(ParDo.of(new DoFn<Integer, List<Integer>>() {
+          @ProcessElement
+          public void processElement(ProcessContext c) {
+            List<Integer> outputList = Arrays.asList(1, 2, 3, 4);
+            c.output(outputList);
+            outputList.set(0, 37);
+            c.output(outputList);
+          }
+        }));
+
+    pipeline.run();
+  }
+
+  /**
+   * Tests that a {@link DoFn} that mutates an output with a good equals() fails in the
    * {@link DirectRunner}.
    */
   @Test
@@ -291,8 +305,9 @@ public class DirectRunnerTest implements Serializable {
 
     pipeline
         .apply(Create.of(42))
-        .apply(ParDo.of(new OldDoFn<Integer, List<Integer>>() {
-          @Override public void processElement(ProcessContext c) {
+        .apply(ParDo.of(new DoFn<Integer, List<Integer>>() {
+          @ProcessElement
+          public void processElement(ProcessContext c) {
             List<Integer> outputList = Arrays.asList(1, 2, 3, 4);
             c.output(outputList);
             outputList.set(0, 37);
@@ -306,7 +321,7 @@ public class DirectRunnerTest implements Serializable {
   }
 
   /**
-   * Tests that a {@link OldDoFn} that mutates an output with a bad equals() still fails
+   * Tests that a {@link DoFn} that mutates an output with a bad equals() still fails
    * in the {@link DirectRunner}.
    */
   @Test
@@ -315,8 +330,9 @@ public class DirectRunnerTest implements Serializable {
 
     pipeline
         .apply(Create.of(42))
-        .apply(ParDo.of(new OldDoFn<Integer, byte[]>() {
-          @Override public void processElement(ProcessContext c) {
+        .apply(ParDo.of(new DoFn<Integer, byte[]>() {
+          @ProcessElement
+          public void processElement(ProcessContext c) {
             byte[] outputArray = new byte[]{0x1, 0x2, 0x3};
             c.output(outputArray);
             outputArray[0] = 0xa;
@@ -331,7 +347,7 @@ public class DirectRunnerTest implements Serializable {
   }
 
   /**
-   * Tests that a {@link OldDoFn} that mutates its input with a good equals() fails in the
+   * Tests that a {@link DoFn} that mutates its input with a good equals() fails in the
    * {@link DirectRunner}.
    */
   @Test
@@ -341,8 +357,9 @@ public class DirectRunnerTest implements Serializable {
     pipeline
         .apply(Create.of(Arrays.asList(1, 2, 3), Arrays.asList(4, 5, 6))
             .withCoder(ListCoder.of(VarIntCoder.of())))
-        .apply(ParDo.of(new OldDoFn<List<Integer>, Integer>() {
-          @Override public void processElement(ProcessContext c) {
+        .apply(ParDo.of(new DoFn<List<Integer>, Integer>() {
+          @ProcessElement
+          public void processElement(ProcessContext c) {
             List<Integer> inputList = c.element();
             inputList.set(0, 37);
             c.output(12);
@@ -356,7 +373,7 @@ public class DirectRunnerTest implements Serializable {
   }
 
   /**
-   * Tests that a {@link OldDoFn} that mutates an input with a bad equals() still fails
+   * Tests that a {@link DoFn} that mutates an input with a bad equals() still fails
    * in the {@link DirectRunner}.
    */
   @Test
@@ -365,8 +382,9 @@ public class DirectRunnerTest implements Serializable {
 
     pipeline
         .apply(Create.of(new byte[]{0x1, 0x2, 0x3}, new byte[]{0x4, 0x5, 0x6}))
-        .apply(ParDo.of(new OldDoFn<byte[], Integer>() {
-          @Override public void processElement(ProcessContext c) {
+        .apply(ParDo.of(new DoFn<byte[], Integer>() {
+          @ProcessElement
+          public void processElement(ProcessContext c) {
             byte[] inputArray = c.element();
             inputArray[0] = 0xa;
             c.output(13);
@@ -377,5 +395,107 @@ public class DirectRunnerTest implements Serializable {
     thrown.expectMessage("Input");
     thrown.expectMessage("must not be mutated");
     pipeline.run();
+  }
+
+  @Test
+  public void testUnencodableOutputElement() throws Exception {
+    Pipeline p = getPipeline();
+    PCollection<Long> pcollection =
+        p.apply(Create.of((Void) null)).apply(ParDo.of(new DoFn<Void, Long>() {
+          @ProcessElement
+          public void processElement(ProcessContext c) {
+            c.output(null);
+          }
+        })).setCoder(VarLongCoder.of());
+    pcollection
+        .apply(
+            ParDo.of(
+                new DoFn<Long, Long>() {
+                  @ProcessElement
+                  public void unreachable(ProcessContext c) {
+                    fail("Pipeline should fail to encode a null Long in VarLongCoder");
+                  }
+                }));
+
+    thrown.expectCause(isA(CoderException.class));
+    thrown.expectMessage("cannot encode a null Long");
+    p.run();
+  }
+
+  @Test
+  public void testUnencodableOutputFromBoundedRead() throws Exception {
+    Pipeline p = getPipeline();
+    PCollection<Long> pCollection =
+        p.apply(CountingInput.upTo(10)).setCoder(new LongNoDecodeCoder());
+
+    thrown.expectCause(isA(CoderException.class));
+    thrown.expectMessage("Cannot decode a long");
+    p.run();
+  }
+
+  @Test
+  public void testUnencodableOutputFromUnboundedRead() {
+    Pipeline p = getPipeline();
+    PCollection<Long> pCollection =
+        p.apply(CountingInput.unbounded()).setCoder(new LongNoDecodeCoder());
+
+    thrown.expectCause(isA(CoderException.class));
+    thrown.expectMessage("Cannot decode a long");
+    p.run();
+  }
+
+  private static class LongNoDecodeCoder extends AtomicCoder<Long> {
+    @Override
+    public void encode(
+        Long value, OutputStream outStream, Context context) throws IOException {
+    }
+
+    @Override
+    public Long decode(InputStream inStream, Context context) throws IOException {
+      throw new CoderException("Cannot decode a long");
+    }
+  }
+
+  private static class MustSplitSource<T> extends BoundedSource<T>{
+    public static <T> BoundedSource<T> of(BoundedSource<T> underlying) {
+      return new MustSplitSource<>(underlying);
+    }
+
+    private final BoundedSource<T> underlying;
+
+    public MustSplitSource(BoundedSource<T> underlying) {
+      this.underlying = underlying;
+    }
+
+    @Override
+    public List<? extends BoundedSource<T>> splitIntoBundles(
+        long desiredBundleSizeBytes, PipelineOptions options) throws Exception {
+      // Must have more than
+      checkState(
+          desiredBundleSizeBytes < getEstimatedSizeBytes(options),
+          "Must split into more than one source");
+      return underlying.splitIntoBundles(desiredBundleSizeBytes, options);
+    }
+
+    @Override
+    public long getEstimatedSizeBytes(PipelineOptions options) throws Exception {
+      return underlying.getEstimatedSizeBytes(options);
+    }
+
+    @Override
+    public BoundedReader<T> createReader(PipelineOptions options) throws IOException {
+      throw new IllegalStateException(
+          "The MustSplitSource cannot create a reader without being split first");
+    }
+
+    @Override
+    public void validate() {
+      underlying.validate();
+    }
+
+    @Override
+    public Coder<T> getDefaultOutputCoder() {
+      return underlying.getDefaultOutputCoder();
+    }
   }
 }

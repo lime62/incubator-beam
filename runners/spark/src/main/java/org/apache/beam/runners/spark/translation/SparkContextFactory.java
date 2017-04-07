@@ -18,7 +18,9 @@
 
 package org.apache.beam.runners.spark.translation;
 
+import org.apache.beam.runners.spark.SparkContextOptions;
 import org.apache.beam.runners.spark.SparkPipelineOptions;
+import org.apache.beam.runners.spark.coders.BeamSparkRunnerRegistrator;
 import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.serializer.KryoSerializer;
@@ -36,19 +38,26 @@ public final class SparkContextFactory {
    * {@code true} then the Spark context will be reused for beam pipelines.
    * This property should only be enabled for tests.
    */
-  static final String TEST_REUSE_SPARK_CONTEXT = "beam.spark.test.reuseSparkContext";
+  public static final String TEST_REUSE_SPARK_CONTEXT = "beam.spark.test.reuseSparkContext";
 
+  // Spark allows only one context for JVM so this can be static.
   private static JavaSparkContext sparkContext;
   private static String sparkMaster;
+  private static boolean usesProvidedSparkContext;
 
   private SparkContextFactory() {
   }
 
   public static synchronized JavaSparkContext getSparkContext(SparkPipelineOptions options) {
+    SparkContextOptions contextOptions = options.as(SparkContextOptions.class);
+    usesProvidedSparkContext = contextOptions.getUsesProvidedSparkContext();
     // reuse should be ignored if the context is provided.
-    if (Boolean.getBoolean(TEST_REUSE_SPARK_CONTEXT) && !options.getUsesProvidedSparkContext()) {
-      if (sparkContext == null) {
-        sparkContext = createSparkContext(options);
+    if (Boolean.getBoolean(TEST_REUSE_SPARK_CONTEXT)
+        && !usesProvidedSparkContext) {
+
+      // if the context is null or stopped for some reason, re-create it.
+      if (sparkContext == null || sparkContext.sc().isStopped()) {
+        sparkContext = createSparkContext(contextOptions);
         sparkMaster = options.getSparkMaster();
       } else if (!options.getSparkMaster().equals(sparkMaster)) {
         throw new IllegalArgumentException(String.format("Cannot reuse spark context "
@@ -57,20 +66,21 @@ public final class SparkContextFactory {
       }
       return sparkContext;
     } else {
-      return createSparkContext(options);
+      return createSparkContext(contextOptions);
     }
   }
 
-  static synchronized void stopSparkContext(JavaSparkContext context) {
-    if (!Boolean.getBoolean(TEST_REUSE_SPARK_CONTEXT)) {
+  public static synchronized void stopSparkContext(JavaSparkContext context) {
+    if (!Boolean.getBoolean(TEST_REUSE_SPARK_CONTEXT)
+            && !usesProvidedSparkContext) {
       context.stop();
     }
   }
 
-  private static JavaSparkContext createSparkContext(SparkPipelineOptions options) {
-    if (options.getUsesProvidedSparkContext()) {
+  private static JavaSparkContext createSparkContext(SparkContextOptions contextOptions) {
+    if (usesProvidedSparkContext) {
       LOG.info("Using a provided Spark Context");
-      JavaSparkContext jsc = options.getProvidedSparkContext();
+      JavaSparkContext jsc = contextOptions.getProvidedSparkContext();
       if (jsc == null || jsc.sc().isStopped()){
         LOG.error("The provided Spark context " + jsc + " was not created or was stopped");
         throw new RuntimeException("The provided Spark context was not created or was stopped");
@@ -81,10 +91,12 @@ public final class SparkContextFactory {
       SparkConf conf = new SparkConf();
       if (!conf.contains("spark.master")) {
         // set master if not set.
-        conf.setMaster(options.getSparkMaster());
+        conf.setMaster(contextOptions.getSparkMaster());
       }
-      conf.setAppName(options.getAppName());
-      conf.set("spark.serializer", KryoSerializer.class.getCanonicalName());
+      conf.setAppName(contextOptions.getAppName());
+      // register immutable collections serializers because the SDK uses them.
+      conf.set("spark.kryo.registrator", BeamSparkRunnerRegistrator.class.getName());
+      conf.set("spark.serializer", KryoSerializer.class.getName());
       return new JavaSparkContext(conf);
     }
   }

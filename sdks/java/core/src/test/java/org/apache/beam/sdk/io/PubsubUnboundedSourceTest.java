@@ -19,7 +19,12 @@
 package org.apache.beam.sdk.io;
 
 import static junit.framework.TestCase.assertFalse;
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.greaterThan;
+import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.lessThanOrEqualTo;
+import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.nullValue;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
@@ -38,16 +43,21 @@ import org.apache.beam.sdk.coders.StringUtf8Coder;
 import org.apache.beam.sdk.io.PubsubUnboundedSource.PubsubCheckpoint;
 import org.apache.beam.sdk.io.PubsubUnboundedSource.PubsubReader;
 import org.apache.beam.sdk.io.PubsubUnboundedSource.PubsubSource;
+import org.apache.beam.sdk.options.PipelineOptions;
+import org.apache.beam.sdk.options.PipelineOptionsFactory;
+import org.apache.beam.sdk.options.ValueProvider.StaticValueProvider;
 import org.apache.beam.sdk.testing.CoderProperties;
 import org.apache.beam.sdk.testing.TestPipeline;
 import org.apache.beam.sdk.util.CoderUtils;
 import org.apache.beam.sdk.util.PubsubClient;
 import org.apache.beam.sdk.util.PubsubClient.IncomingMessage;
 import org.apache.beam.sdk.util.PubsubClient.SubscriptionPath;
+import org.apache.beam.sdk.util.PubsubClient.TopicPath;
 import org.apache.beam.sdk.util.PubsubTestClient;
 import org.apache.beam.sdk.util.PubsubTestClient.PubsubTestClientFactory;
 import org.joda.time.Instant;
 import org.junit.After;
+import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
@@ -73,6 +83,9 @@ public class PubsubUnboundedSourceTest {
   private PubsubTestClientFactory factory;
   private PubsubSource<String> primSource;
 
+  @Rule
+  public TestPipeline p = TestPipeline.create();
+
   private void setupOneMessage(Iterable<IncomingMessage> incoming) {
     now = new AtomicLong(REQ_TIME);
     clock = new Clock() {
@@ -83,14 +96,15 @@ public class PubsubUnboundedSourceTest {
     };
     factory = PubsubTestClient.createFactoryForPull(clock, SUBSCRIPTION, ACK_TIMEOUT_S, incoming);
     PubsubUnboundedSource<String> source =
-        new PubsubUnboundedSource<>(clock, factory, null, null, SUBSCRIPTION, StringUtf8Coder.of(),
-                                    TIMESTAMP_LABEL, ID_LABEL);
+        new PubsubUnboundedSource<>(
+            clock, factory, null, null, StaticValueProvider.of(SUBSCRIPTION),
+            StringUtf8Coder.of(), TIMESTAMP_LABEL, ID_LABEL, null);
     primSource = new PubsubSource<>(source);
   }
 
   private void setupOneMessage() {
     setupOneMessage(ImmutableList.of(
-        new IncomingMessage(DATA.getBytes(), TIMESTAMP, 0, ACK_ID, RECORD_ID)));
+        new IncomingMessage(DATA.getBytes(), null, TIMESTAMP, 0, ACK_ID, RECORD_ID)));
   }
 
   @After
@@ -114,7 +128,6 @@ public class PubsubUnboundedSourceTest {
   @Test
   public void readOneMessage() throws IOException {
     setupOneMessage();
-    TestPipeline p = TestPipeline.create();
     PubsubReader<String> reader = primSource.createReader(p.getOptions(), null);
     // Read one message.
     assertTrue(reader.start());
@@ -129,7 +142,6 @@ public class PubsubUnboundedSourceTest {
   @Test
   public void timeoutAckAndRereadOneMessage() throws IOException {
     setupOneMessage();
-    TestPipeline p = TestPipeline.create();
     PubsubReader<String> reader = primSource.createReader(p.getOptions(), null);
     PubsubTestClient pubsubClient = (PubsubTestClient) reader.getPubsubClient();
     assertTrue(reader.start());
@@ -150,7 +162,6 @@ public class PubsubUnboundedSourceTest {
   @Test
   public void extendAck() throws IOException {
     setupOneMessage();
-    TestPipeline p = TestPipeline.create();
     PubsubReader<String> reader = primSource.createReader(p.getOptions(), null);
     PubsubTestClient pubsubClient = (PubsubTestClient) reader.getPubsubClient();
     // Pull the first message but don't take a checkpoint for it.
@@ -173,7 +184,6 @@ public class PubsubUnboundedSourceTest {
   @Test
   public void timeoutAckExtensions() throws IOException {
     setupOneMessage();
-    TestPipeline p = TestPipeline.create();
     PubsubReader<String> reader = primSource.createReader(p.getOptions(), null);
     PubsubTestClient pubsubClient = (PubsubTestClient) reader.getPubsubClient();
     // Pull the first message but don't take a checkpoint for it.
@@ -207,10 +217,9 @@ public class PubsubUnboundedSourceTest {
     for (int i = 0; i < 2; i++) {
       String data = String.format("data_%d", i);
       String ackid = String.format("ackid_%d", i);
-      incoming.add(new IncomingMessage(data.getBytes(), TIMESTAMP, 0, ackid, RECORD_ID));
+      incoming.add(new IncomingMessage(data.getBytes(), null, TIMESTAMP, 0, ackid, RECORD_ID));
     }
     setupOneMessage(incoming);
-    TestPipeline p = TestPipeline.create();
     PubsubReader<String> reader = primSource.createReader(p.getOptions(), null);
     // Consume two messages, only read one.
     assertTrue(reader.start());
@@ -266,12 +275,11 @@ public class PubsubUnboundedSourceTest {
       dataToMessageNum.put(data, messageNum);
       String recid = String.format("recordid_%d", messageNum);
       String ackId = String.format("ackid_%d", messageNum);
-      incoming.add(new IncomingMessage(data.getBytes(), messageNumToTimestamp(messageNum), 0,
+      incoming.add(new IncomingMessage(data.getBytes(), null, messageNumToTimestamp(messageNum), 0,
                                        ackId, recid));
     }
     setupOneMessage(incoming);
 
-    TestPipeline p = TestPipeline.create();
     PubsubReader<String> reader = primSource.createReader(p.getOptions(), null);
     PubsubTestClient pubsubClient = (PubsubTestClient) reader.getPubsubClient();
 
@@ -315,5 +323,76 @@ public class PubsubUnboundedSourceTest {
     // We saw each message exactly once.
     assertTrue(dataToMessageNum.isEmpty());
     reader.close();
+  }
+
+  @Test
+  public void noSubscriptionSplitIntoBundlesGeneratesSubscription() throws Exception {
+    TopicPath topicPath = PubsubClient.topicPathFromName("my_project", "my_topic");
+    factory = PubsubTestClient.createFactoryForCreateSubscription();
+    PubsubUnboundedSource<String> source =
+        new PubsubUnboundedSource<>(
+            factory,
+            StaticValueProvider.of(PubsubClient.projectPathFromId("my_project")),
+            StaticValueProvider.of(topicPath),
+            null,
+            StringUtf8Coder.of(),
+            null,
+            null,
+            null);
+    assertThat(source.getSubscription(), nullValue());
+
+    assertThat(source.getSubscription(), nullValue());
+
+    PipelineOptions options = PipelineOptionsFactory.create();
+    List<PubsubSource<String>> splits =
+        (new PubsubSource<>(source)).generateInitialSplits(3, options);
+    // We have at least one returned split
+    assertThat(splits, hasSize(greaterThan(0)));
+    for (PubsubSource<String> split : splits) {
+      // Each split is equal
+      assertThat(split, equalTo(splits.get(0)));
+    }
+
+    assertThat(splits.get(0).subscriptionPath, not(nullValue()));
+  }
+
+  @Test
+  public void noSubscriptionNoSplitGeneratesSubscription() throws Exception {
+    TopicPath topicPath = PubsubClient.topicPathFromName("my_project", "my_topic");
+    factory = PubsubTestClient.createFactoryForCreateSubscription();
+    PubsubUnboundedSource<String> source =
+        new PubsubUnboundedSource<>(
+            factory,
+            StaticValueProvider.of(PubsubClient.projectPathFromId("my_project")),
+            StaticValueProvider.of(topicPath),
+            null,
+            StringUtf8Coder.of(),
+            null,
+            null,
+            null);
+    assertThat(source.getSubscription(), nullValue());
+
+    assertThat(source.getSubscription(), nullValue());
+
+    PipelineOptions options = PipelineOptionsFactory.create();
+    PubsubSource<String> actualSource = new PubsubSource<>(source);
+    PubsubReader<String> reader = actualSource.createReader(options, null);
+    SubscriptionPath createdSubscription = reader.subscription;
+    assertThat(createdSubscription, not(nullValue()));
+
+    PubsubCheckpoint<String> checkpoint = reader.getCheckpointMark();
+    assertThat(checkpoint.subscriptionPath, equalTo(createdSubscription.getPath()));
+
+    checkpoint.finalizeCheckpoint();
+    PubsubCheckpoint<String> deserCheckpoint =
+        CoderUtils.clone(actualSource.getCheckpointMarkCoder(), checkpoint);
+    assertThat(checkpoint.subscriptionPath, not(nullValue()));
+    assertThat(checkpoint.subscriptionPath, equalTo(deserCheckpoint.subscriptionPath));
+
+    PubsubReader<String> readerFromOriginal = actualSource.createReader(options, checkpoint);
+    PubsubReader<String> readerFromDeser = actualSource.createReader(options, deserCheckpoint);
+
+    assertThat(readerFromOriginal.subscription, equalTo(createdSubscription));
+    assertThat(readerFromDeser.subscription, equalTo(createdSubscription));
   }
 }

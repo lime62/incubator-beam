@@ -19,212 +19,138 @@
 package org.apache.beam.runners.spark.translation;
 
 import com.google.common.collect.AbstractIterator;
-import com.google.common.collect.Iterables;
+import com.google.common.collect.Lists;
 import java.io.IOException;
-import java.util.Collection;
 import java.util.Iterator;
-import java.util.Map;
-import org.apache.beam.runners.spark.aggregators.NamedAggregators;
-import org.apache.beam.runners.spark.util.BroadcastHelper;
+import org.apache.beam.runners.core.DoFnRunner;
+import org.apache.beam.runners.core.DoFnRunners.OutputManager;
+import org.apache.beam.runners.core.ExecutionContext.StepContext;
+import org.apache.beam.runners.core.StateInternals;
+import org.apache.beam.runners.core.TimerInternals;
 import org.apache.beam.sdk.coders.Coder;
-import org.apache.beam.sdk.options.PipelineOptions;
-import org.apache.beam.sdk.transforms.Aggregator;
-import org.apache.beam.sdk.transforms.Combine;
-import org.apache.beam.sdk.transforms.OldDoFn;
+import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.reflect.DoFnInvokers;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
-import org.apache.beam.sdk.transforms.windowing.PaneInfo;
-import org.apache.beam.sdk.util.TimerInternals;
 import org.apache.beam.sdk.util.WindowedValue;
-import org.apache.beam.sdk.util.WindowingInternals;
-import org.apache.beam.sdk.util.state.InMemoryStateInternals;
-import org.apache.beam.sdk.util.state.StateInternals;
-import org.apache.beam.sdk.values.PCollectionView;
 import org.apache.beam.sdk.values.TupleTag;
-import org.apache.spark.Accumulator;
-import org.joda.time.Instant;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+
 
 /**
- * Spark runner process context.
+ * Spark runner process context processes Spark partitions using Beam's {@link DoFnRunner}.
  */
-public abstract class SparkProcessContext<InputT, OutputT, ValueT>
-    extends OldDoFn<InputT, OutputT>.ProcessContext {
+class SparkProcessContext<FnInputT, FnOutputT, OutputT> {
 
-  private static final Logger LOG = LoggerFactory.getLogger(SparkProcessContext.class);
+  private final DoFn<FnInputT, FnOutputT> doFn;
+  private final DoFnRunner<FnInputT, FnOutputT> doFnRunner;
+  private final SparkOutputManager<OutputT> outputManager;
 
-  private final OldDoFn<InputT, OutputT> fn;
-  private final SparkRuntimeContext mRuntimeContext;
-  private final Map<TupleTag<?>, BroadcastHelper<?>> mSideInputs;
+  SparkProcessContext(
+      DoFn<FnInputT, FnOutputT> doFn,
+      DoFnRunner<FnInputT, FnOutputT> doFnRunner,
+      SparkOutputManager<OutputT> outputManager) {
 
-  protected WindowedValue<InputT> windowedValue;
-
-  SparkProcessContext(OldDoFn<InputT, OutputT> fn,
-      SparkRuntimeContext runtime,
-      Map<TupleTag<?>, BroadcastHelper<?>> sideInputs) {
-    fn.super();
-    this.fn = fn;
-    this.mRuntimeContext = runtime;
-    this.mSideInputs = sideInputs;
+    this.doFn = doFn;
+    this.doFnRunner = doFnRunner;
+    this.outputManager = outputManager;
   }
 
-  void setup() {
-    setupDelegateAggregators();
-  }
+  Iterable<OutputT> processPartition(
+      Iterator<WindowedValue<FnInputT>> partition) throws Exception {
 
-  @Override
-  public PipelineOptions getPipelineOptions() {
-    return mRuntimeContext.getPipelineOptions();
-  }
+    // setup DoFn.
+    DoFnInvokers.invokerFor(doFn).invokeSetup();
 
-  @Override
-  public <T> T sideInput(PCollectionView<T> view) {
-    @SuppressWarnings("unchecked")
-    BroadcastHelper<Iterable<WindowedValue<?>>> broadcastHelper =
-        (BroadcastHelper<Iterable<WindowedValue<?>>>) mSideInputs.get(view.getTagInternal());
-    Iterable<WindowedValue<?>> contents = broadcastHelper.getValue();
-    return view.getViewFn().apply(contents);
-  }
-
-  @Override
-  public abstract void output(OutputT output);
-
-  public abstract void output(WindowedValue<OutputT> output);
-
-  @Override
-  public <T> void sideOutput(TupleTag<T> tupleTag, T t) {
-    String message = "sideOutput is an unsupported operation for doFunctions, use a "
-        + "MultiDoFunction instead.";
-    LOG.warn(message);
-    throw new UnsupportedOperationException(message);
-  }
-
-  @Override
-  public <T> void sideOutputWithTimestamp(TupleTag<T> tupleTag, T t, Instant instant) {
-    String message =
-        "sideOutputWithTimestamp is an unsupported operation for doFunctions, use a "
-            + "MultiDoFunction instead.";
-    LOG.warn(message);
-    throw new UnsupportedOperationException(message);
-  }
-
-  @Override
-  public <AggregatprInputT, AggregatorOutputT>
-  Aggregator<AggregatprInputT, AggregatorOutputT> createAggregatorInternal(
-          String named,
-          Combine.CombineFn<AggregatprInputT, ?, AggregatorOutputT> combineFn) {
-    return mRuntimeContext.createAggregator(getAccumulator(), named, combineFn);
-  }
-
-  public abstract Accumulator<NamedAggregators> getAccumulator();
-
-  @Override
-  public InputT element() {
-    return windowedValue.getValue();
-  }
-
-  @Override
-  public void outputWithTimestamp(OutputT output, Instant timestamp) {
-    output(WindowedValue.of(output, timestamp,
-        windowedValue.getWindows(), windowedValue.getPane()));
-  }
-
-  @Override
-  public Instant timestamp() {
-    return windowedValue.getTimestamp();
-  }
-
-  @Override
-  public BoundedWindow window() {
-    if (!(fn instanceof OldDoFn.RequiresWindowAccess)) {
-      throw new UnsupportedOperationException(
-          "window() is only available in the context of a OldDoFn marked as RequiresWindowAccess.");
+    // skip if partition is empty.
+    if (!partition.hasNext()) {
+      DoFnInvokers.invokerFor(doFn).invokeTeardown();
+      return Lists.newArrayList();
     }
-    return Iterables.getOnlyElement(windowedValue.getWindows());
+
+    // call startBundle() before beginning to process the partition.
+    doFnRunner.startBundle();
+    // process the partition; finishBundle() is called from within the output iterator.
+    return this.getOutputIterable(partition, doFnRunner);
   }
 
-  @Override
-  public PaneInfo pane() {
-    return windowedValue.getPane();
+  private void clearOutput() {
+    outputManager.clear();
   }
 
-  @Override
-  public WindowingInternals<InputT, OutputT> windowingInternals() {
-    return new WindowingInternals<InputT, OutputT>() {
+  private Iterator<OutputT> getOutputIterator() {
+    return outputManager.iterator();
+  }
 
-      @Override
-      public Collection<? extends BoundedWindow> windows() {
-        return windowedValue.getWindows();
-      }
+  private Iterable<OutputT> getOutputIterable(
+      final Iterator<WindowedValue<FnInputT>> iter,
+      final DoFnRunner<FnInputT, FnOutputT> doFnRunner) {
 
+    return new Iterable<OutputT>() {
       @Override
-      public void outputWindowedValue(OutputT output, Instant timestamp, Collection<?
-          extends BoundedWindow> windows, PaneInfo paneInfo) {
-        output(WindowedValue.of(output, timestamp, windows, paneInfo));
-      }
-
-      @Override
-      public StateInternals stateInternals() {
-        //TODO: implement state internals.
-        // This is a temporary placeholder to get the TfIdfTest
-        // working for the initial Beam code drop.
-        return InMemoryStateInternals.forKey("DUMMY");
-      }
-
-      @Override
-      public TimerInternals timerInternals() {
-        throw new UnsupportedOperationException(
-            "WindowingInternals#timerInternals() is not yet supported.");
-      }
-
-      @Override
-      public PaneInfo pane() {
-        return windowedValue.getPane();
-      }
-
-      @Override
-      public <T> void writePCollectionViewData(TupleTag<?> tag,
-          Iterable<WindowedValue<T>> data, Coder<T> elemCoder) throws IOException {
-        throw new UnsupportedOperationException(
-            "WindowingInternals#writePCollectionViewData() is not yet supported.");
-      }
-
-      @Override
-      public <T> T sideInput(PCollectionView<T> view, BoundedWindow mainInputWindow) {
-        throw new UnsupportedOperationException(
-            "WindowingInternals#sideInput() is not yet supported.");
+      public Iterator<OutputT> iterator() {
+        return new ProcCtxtIterator(iter, doFnRunner);
       }
     };
   }
 
-  protected abstract void clearOutput();
-  protected abstract Iterator<ValueT> getOutputIterator();
+  interface SparkOutputManager<T> extends OutputManager, Iterable<T> {
 
-  protected Iterable<ValueT> getOutputIterable(final Iterator<WindowedValue<InputT>> iter,
-                                               final OldDoFn<InputT, OutputT> doFn) {
-    return new Iterable<ValueT>() {
-      @Override
-      public Iterator<ValueT> iterator() {
-        return new ProcCtxtIterator(iter, doFn);
-      }
-    };
+    void clear();
+
   }
 
-  private class ProcCtxtIterator extends AbstractIterator<ValueT> {
+  static class NoOpStepContext implements StepContext {
+    @Override
+    public String getStepName() {
+      return null;
+    }
 
-    private final Iterator<WindowedValue<InputT>> inputIterator;
-    private final OldDoFn<InputT, OutputT> doFn;
-    private Iterator<ValueT> outputIterator;
+    @Override
+    public String getTransformName() {
+      return null;
+    }
+
+    @Override
+    public void noteOutput(WindowedValue<?> output) { }
+
+    @Override
+    public void noteSideOutput(TupleTag<?> tag, WindowedValue<?> output) { }
+
+    @Override
+    public <T, W extends BoundedWindow> void writePCollectionViewData(
+        TupleTag<?> tag,
+        Iterable<WindowedValue<T>> data,
+        Coder<Iterable<WindowedValue<T>>> dataCoder,
+        W window,
+        Coder<W> windowCoder) throws IOException { }
+
+    @Override
+    public StateInternals<?> stateInternals() {
+      return null;
+    }
+
+    @Override
+    public TimerInternals timerInternals() {
+      return null;
+    }
+  }
+
+  private class ProcCtxtIterator extends AbstractIterator<OutputT> {
+
+    private final Iterator<WindowedValue<FnInputT>> inputIterator;
+    private final DoFnRunner<FnInputT, FnOutputT> doFnRunner;
+    private Iterator<OutputT> outputIterator;
     private boolean calledFinish;
 
-    ProcCtxtIterator(Iterator<WindowedValue<InputT>> iterator, OldDoFn<InputT, OutputT> doFn) {
+    ProcCtxtIterator(
+        Iterator<WindowedValue<FnInputT>> iterator,
+        DoFnRunner<FnInputT, FnOutputT> doFnRunner) {
       this.inputIterator = iterator;
-      this.doFn = doFn;
+      this.doFnRunner = doFnRunner;
       this.outputIterator = getOutputIterator();
     }
 
     @Override
-    protected ValueT computeNext() {
+    protected OutputT computeNext() {
       // Process each element from the (input) iterator, which produces, zero, one or more
       // output elements (of type V) in the output iterator. Note that the output
       // collection (and iterator) is reset between each call to processElement, so the
@@ -235,56 +161,23 @@ public abstract class SparkProcessContext<InputT, OutputT, ValueT>
           return outputIterator.next();
         } else if (inputIterator.hasNext()) {
           clearOutput();
-          windowedValue = inputIterator.next();
-          try {
-            doFn.processElement(SparkProcessContext.this);
-          } catch (Exception e) {
-            handleProcessingException(e);
-            throw new SparkProcessException(e);
-          }
+          // grab the next element and process it.
+          doFnRunner.processElement(inputIterator.next());
           outputIterator = getOutputIterator();
         } else {
           // no more input to consume, but finishBundle can produce more output
           if (!calledFinish) {
             clearOutput();
-            try {
-              calledFinish = true;
-              doFn.finishBundle(SparkProcessContext.this);
-            } catch (Exception e) {
-              handleProcessingException(e);
-              throw new SparkProcessException(e);
-            }
+            calledFinish = true;
+            doFnRunner.finishBundle();
+            // teardown DoFn.
+            DoFnInvokers.invokerFor(doFn).invokeTeardown();
             outputIterator = getOutputIterator();
             continue; // try to consume outputIterator from start of loop
-          }
-          try {
-            doFn.teardown();
-          } catch (Exception e) {
-            LOG.error(
-                "Suppressing teardown exception that occurred after processing entire input", e);
           }
           return endOfData();
         }
       }
     }
-
-    private void handleProcessingException(Exception e) {
-      try {
-        doFn.teardown();
-      } catch (Exception e1) {
-        LOG.error("Exception while cleaning up DoFn", e1);
-        e.addSuppressed(e1);
-      }
-    }
   }
-
-  /**
-   * Spark process runtime exception.
-   */
-  public static class SparkProcessException extends RuntimeException {
-    SparkProcessException(Throwable t) {
-      super(t);
-    }
-  }
-
 }

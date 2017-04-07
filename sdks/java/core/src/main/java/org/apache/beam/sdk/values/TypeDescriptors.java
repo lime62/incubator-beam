@@ -17,7 +17,6 @@
  */
 package org.apache.beam.sdk.values;
 
-import com.google.common.reflect.TypeParameter;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.List;
@@ -180,8 +179,8 @@ public class TypeDescriptors {
    * <pre>
    * new TypeDescriptor&lt;KV&lt;K,V&gt;&gt;() {};
    * </pre>
-   * <p>
-   * Example of use:
+   *
+   * <p>Example of use:
    * <pre>
    * {@code
    * PCollection<String> words = ...;
@@ -211,8 +210,8 @@ public class TypeDescriptors {
    * <pre>
    * new TypeDescriptor&lt;Set&lt;E&gt;&gt;() {};
    * </pre>
-   * <p>
-   * Example of use:
+   *
+   * <p>Example of use:
    * <pre>
    * {@code
    * PCollection<String> words = ...;
@@ -239,8 +238,8 @@ public class TypeDescriptors {
    * <pre>
    * new TypeDescriptor&lt;List&lt;E&gt;&gt;() {};
    * </pre>
-   * <p>
-   * Example of use:
+   *
+   * <p>Example of use:
    * <pre>
    * {@code
    * PCollection<String> words = ...;
@@ -267,8 +266,8 @@ public class TypeDescriptors {
    * <pre>
    * new TypeDescriptor&lt;Iterable&lt;E&gt;&gt;() {};
    * </pre>
-   * <p>
-   * Example of use:
+   *
+   * <p>Example of use:
    * <pre>
    * {@code
    * PCollection<String> words = ...;

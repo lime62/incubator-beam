@@ -18,7 +18,6 @@
 
 package org.apache.beam.examples.complete.game;
 
-import static org.apache.beam.sdk.testing.PAssert.that;
 import static org.hamcrest.Matchers.hasItem;
 import static org.junit.Assert.assertThat;
 
@@ -28,6 +27,7 @@ import org.apache.beam.examples.complete.game.LeaderBoard.CalculateTeamScores;
 import org.apache.beam.examples.complete.game.LeaderBoard.CalculateUserScores;
 import org.apache.beam.examples.complete.game.UserScore.GameActionInfo;
 import org.apache.beam.sdk.coders.AvroCoder;
+import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.testing.PAssert;
 import org.apache.beam.sdk.testing.TestPipeline;
 import org.apache.beam.sdk.testing.TestStream;
@@ -41,6 +41,7 @@ import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.TimestampedValue;
 import org.joda.time.Duration;
 import org.joda.time.Instant;
+import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
@@ -54,6 +55,8 @@ public class LeaderBoardTest implements Serializable {
   private static final Duration TEAM_WINDOW_DURATION = Duration.standardMinutes(20);
   private Instant baseTime = new Instant(0);
 
+  @Rule
+  public TestPipeline p = TestPipeline.create();
   /**
    * Some example users, on two separate teams.
    */
@@ -84,7 +87,6 @@ public class LeaderBoardTest implements Serializable {
    */
   @Test
   public void testTeamScoresOnTime() {
-    TestPipeline p = TestPipeline.create();
 
     TestStream<GameActionInfo> createEvents = TestStream.create(AvroCoder.of(GameActionInfo.class))
         // Start at the epoch
@@ -107,11 +109,11 @@ public class LeaderBoardTest implements Serializable {
 
     String blueTeam = TestUser.BLUE_ONE.getTeam();
     String redTeam = TestUser.RED_ONE.getTeam();
-    that(teamScores)
+    PAssert.that(teamScores)
         .inOnTimePane(new IntervalWindow(baseTime, TEAM_WINDOW_DURATION))
         .containsInAnyOrder(KV.of(blueTeam, 12), KV.of(redTeam, 4));
 
-    p.run();
+    p.run().waitUntilFinish();
   }
 
   /**
@@ -120,7 +122,6 @@ public class LeaderBoardTest implements Serializable {
    */
   @Test
   public void testTeamScoresSpeculative() {
-    TestPipeline p = TestPipeline.create();
 
     TestStream<GameActionInfo> createEvents = TestStream.create(AvroCoder.of(GameActionInfo.class))
         // Start at the epoch
@@ -161,7 +162,7 @@ public class LeaderBoardTest implements Serializable {
         .inOnTimePane(window)
         .containsInAnyOrder(KV.of(blueTeam, 10), KV.of(redTeam, 9));
 
-    p.run();
+    p.run().waitUntilFinish();
   }
 
   /**
@@ -170,7 +171,6 @@ public class LeaderBoardTest implements Serializable {
    */
   @Test
   public void testTeamScoresUnobservablyLate() {
-    TestPipeline p = TestPipeline.create();
 
     BoundedWindow window = new IntervalWindow(baseTime, TEAM_WINDOW_DURATION);
     TestStream<GameActionInfo> createEvents = TestStream.create(AvroCoder.of(GameActionInfo.class))
@@ -198,7 +198,7 @@ public class LeaderBoardTest implements Serializable {
         .inOnTimePane(window)
         .containsInAnyOrder(KV.of(redTeam, 14), KV.of(blueTeam, 13));
 
-    p.run();
+    p.run().waitUntilFinish();
   }
 
   /**
@@ -208,7 +208,6 @@ public class LeaderBoardTest implements Serializable {
    */
   @Test
   public void testTeamScoresObservablyLate() {
-    TestPipeline p = TestPipeline.create();
 
     Instant firstWindowCloses = baseTime.plus(ALLOWED_LATENESS).plus(TEAM_WINDOW_DURATION);
     TestStream<GameActionInfo> createEvents = TestStream.create(AvroCoder.of(GameActionInfo.class))
@@ -259,7 +258,7 @@ public class LeaderBoardTest implements Serializable {
     // account in earlier panes
     PAssert.that(teamScores).inFinalPane(window).containsInAnyOrder(KV.of(redTeam, 27));
 
-    p.run();
+    p.run().waitUntilFinish();
   }
 
   /**
@@ -268,7 +267,6 @@ public class LeaderBoardTest implements Serializable {
    */
   @Test
   public void testTeamScoresDroppablyLate() {
-    TestPipeline p = TestPipeline.create();
 
     BoundedWindow window = new IntervalWindow(baseTime, TEAM_WINDOW_DURATION);
     TestStream<GameActionInfo> infos = TestStream.create(AvroCoder.of(GameActionInfo.class))
@@ -299,6 +297,8 @@ public class LeaderBoardTest implements Serializable {
     // No elements are added before the watermark passes the end of the window plus the allowed
     // lateness, so no refinement should be emitted
     PAssert.that(teamScores).inFinalPane(window).empty();
+
+    p.run().waitUntilFinish();
   }
 
   /**
@@ -308,7 +308,6 @@ public class LeaderBoardTest implements Serializable {
    */
   @Test
   public void testUserScore() {
-    TestPipeline p = TestPipeline.create();
 
     TestStream<GameActionInfo> infos =
         TestStream.create(AvroCoder.of(GameActionInfo.class))
@@ -339,7 +338,7 @@ public class LeaderBoardTest implements Serializable {
     // User scores are emitted in speculative panes in the Global Window - this matcher choice
     // ensures that panes emitted by the watermark advancing to positive infinity are not included,
     // as that will not occur outside of tests
-    that(userScores)
+    PAssert.that(userScores)
         .inEarlyGlobalWindowPanes()
         .containsInAnyOrder(KV.of(TestUser.BLUE_ONE.getUser(), 15),
             KV.of(TestUser.RED_ONE.getUser(), 7),
@@ -347,7 +346,12 @@ public class LeaderBoardTest implements Serializable {
             KV.of(TestUser.BLUE_TWO.getUser(), 3),
             KV.of(TestUser.BLUE_TWO.getUser(), 8));
 
-    p.run();
+    p.run().waitUntilFinish();
+  }
+
+  @Test
+  public void testLeaderBoardOptions() {
+    PipelineOptionsFactory.as(LeaderBoard.Options.class);
   }
 
   private TimestampedValue<GameActionInfo> event(

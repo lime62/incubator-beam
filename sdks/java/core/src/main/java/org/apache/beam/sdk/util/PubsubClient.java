@@ -86,13 +86,14 @@ public abstract class PubsubClient implements Closeable {
   /**
    * Return the timestamp (in ms since unix epoch) to use for a Pubsub message with {@code
    * attributes} and {@code pubsubTimestamp}.
+   *
    * <p>If {@code timestampLabel} is non-{@literal null} then the message attributes must contain
    * that label, and the value of that label will be taken as the timestamp.
    * Otherwise the timestamp will be taken from the Pubsub publish timestamp {@code
-   * pubsubTimestamp}. Throw {@link IllegalArgumentException} if the timestamp cannot be
-   * recognized as a ms-since-unix-epoch or RFC3339 time.
+   * pubsubTimestamp}.
    *
-   * @throws IllegalArgumentException
+   * @throws IllegalArgumentException if the timestamp cannot be recognized as a ms-since-unix-epoch
+   * or RFC3339 time.
    */
   protected static long extractTimestamp(
       @Nullable String timestampLabel,
@@ -114,7 +115,7 @@ public abstract class PubsubClient implements Closeable {
                     "Cannot interpret value of label %s as timestamp: %s",
                     timestampLabel, value);
     }
-    return timestampMsSinceEpoch == null ? 0 : timestampMsSinceEpoch;
+    return timestampMsSinceEpoch;
   }
 
   /**
@@ -299,6 +300,7 @@ public abstract class PubsubClient implements Closeable {
 
   /**
    * A message to be sent to Pubsub.
+   *
    * <p>NOTE: This class is {@link Serializable} only to support the {@link PubsubTestClient}.
    * Java serialization is never used for non-test clients.
    */
@@ -307,6 +309,8 @@ public abstract class PubsubClient implements Closeable {
      * Underlying (encoded) element.
      */
     public final byte[] elementBytes;
+
+    public final Map<String, String> attributes;
 
     /**
      * Timestamp for element (ms since epoch).
@@ -320,9 +324,10 @@ public abstract class PubsubClient implements Closeable {
     @Nullable
     public final String recordId;
 
-    public OutgoingMessage(
-        byte[] elementBytes, long timestampMsSinceEpoch, @Nullable String recordId) {
+    public OutgoingMessage(byte[] elementBytes, Map<String, String> attributes,
+                           long timestampMsSinceEpoch, @Nullable String recordId) {
       this.elementBytes = elementBytes;
+      this.attributes = attributes;
       this.timestampMsSinceEpoch = timestampMsSinceEpoch;
       this.recordId = recordId;
     }
@@ -345,18 +350,21 @@ public abstract class PubsubClient implements Closeable {
       OutgoingMessage that = (OutgoingMessage) o;
 
       return timestampMsSinceEpoch == that.timestampMsSinceEpoch
-             && Arrays.equals(elementBytes, that.elementBytes)
-             && Objects.equal(recordId, that.recordId);
+              && Arrays.equals(elementBytes, that.elementBytes)
+              && Objects.equal(attributes, that.attributes)
+              && Objects.equal(recordId, that.recordId);
     }
 
     @Override
     public int hashCode() {
-      return Objects.hashCode(Arrays.hashCode(elementBytes), timestampMsSinceEpoch, recordId);
+      return Objects.hashCode(Arrays.hashCode(elementBytes), attributes, timestampMsSinceEpoch,
+              recordId);
     }
   }
 
   /**
    * A message received from Pubsub.
+   *
    * <p>NOTE: This class is {@link Serializable} only to support the {@link PubsubTestClient}.
    * Java serialization is never used for non-test clients.
    */
@@ -365,6 +373,8 @@ public abstract class PubsubClient implements Closeable {
      * Underlying (encoded) element.
      */
     public final byte[] elementBytes;
+
+    public Map<String, String> attributes;
 
     /**
      * Timestamp for element (ms since epoch). Either Pubsub's processing time,
@@ -389,11 +399,13 @@ public abstract class PubsubClient implements Closeable {
 
     public IncomingMessage(
         byte[] elementBytes,
+        Map<String, String> attributes,
         long timestampMsSinceEpoch,
         long requestTimeMsSinceEpoch,
         String ackId,
         String recordId) {
       this.elementBytes = elementBytes;
+      this.attributes = attributes;
       this.timestampMsSinceEpoch = timestampMsSinceEpoch;
       this.requestTimeMsSinceEpoch = requestTimeMsSinceEpoch;
       this.ackId = ackId;
@@ -401,8 +413,8 @@ public abstract class PubsubClient implements Closeable {
     }
 
     public IncomingMessage withRequestTime(long requestTimeMsSinceEpoch) {
-      return new IncomingMessage(elementBytes, timestampMsSinceEpoch, requestTimeMsSinceEpoch,
-                                 ackId, recordId);
+      return new IncomingMessage(elementBytes, attributes, timestampMsSinceEpoch,
+              requestTimeMsSinceEpoch, ackId, recordId);
     }
 
     @Override
@@ -426,12 +438,13 @@ public abstract class PubsubClient implements Closeable {
              && requestTimeMsSinceEpoch == that.requestTimeMsSinceEpoch
              && ackId.equals(that.ackId)
              && recordId.equals(that.recordId)
-             && Arrays.equals(elementBytes, that.elementBytes);
+             && Arrays.equals(elementBytes, that.elementBytes)
+              && Objects.equal(attributes, that.attributes);
     }
 
     @Override
     public int hashCode() {
-      return Objects.hashCode(Arrays.hashCode(elementBytes), timestampMsSinceEpoch,
+      return Objects.hashCode(Arrays.hashCode(elementBytes), attributes, timestampMsSinceEpoch,
                               requestTimeMsSinceEpoch,
                               ackId, recordId);
     }
@@ -440,8 +453,6 @@ public abstract class PubsubClient implements Closeable {
   /**
    * Publish {@code outgoingMessages} to Pubsub {@code topic}. Return number of messages
    * published.
-   *
-   * @throws IOException
    */
   public abstract int publish(TopicPath topic, List<OutgoingMessage> outgoingMessages)
       throws IOException;
@@ -451,8 +462,6 @@ public abstract class PubsubClient implements Closeable {
    * Return the received messages, or empty collection if none were available. Does not
    * wait for messages to arrive if {@code returnImmediately} is {@literal true}.
    * Returned messages will record their request time as {@code requestTimeMsSinceEpoch}.
-   *
-   * @throws IOException
    */
   public abstract List<IncomingMessage> pull(
       long requestTimeMsSinceEpoch,
@@ -463,8 +472,6 @@ public abstract class PubsubClient implements Closeable {
 
   /**
    * Acknowldege messages from {@code subscription} with {@code ackIds}.
-   *
-   * @throws IOException
    */
   public abstract void acknowledge(SubscriptionPath subscription, List<String> ackIds)
       throws IOException;
@@ -472,8 +479,6 @@ public abstract class PubsubClient implements Closeable {
   /**
    * Modify the ack deadline for messages from {@code subscription} with {@code ackIds} to
    * be {@code deadlineSeconds} from now.
-   *
-   * @throws IOException
    */
   public abstract void modifyAckDeadline(
       SubscriptionPath subscription, List<String> ackIds,
@@ -481,29 +486,21 @@ public abstract class PubsubClient implements Closeable {
 
   /**
    * Create {@code topic}.
-   *
-   * @throws IOException
    */
   public abstract void createTopic(TopicPath topic) throws IOException;
 
   /*
    * Delete {@code topic}.
-   *
-   * @throws IOException
    */
   public abstract void deleteTopic(TopicPath topic) throws IOException;
 
   /**
    * Return a list of topics for {@code project}.
-   *
-   * @throws IOException
    */
   public abstract List<TopicPath> listTopics(ProjectPath project) throws IOException;
 
   /**
    * Create {@code subscription} to {@code topic}.
-   *
-   * @throws IOException
    */
   public abstract void createSubscription(
       TopicPath topic, SubscriptionPath subscription, int ackDeadlineSeconds) throws IOException;
@@ -511,8 +508,6 @@ public abstract class PubsubClient implements Closeable {
   /**
    * Create a random subscription for {@code topic}. Return the {@link SubscriptionPath}. It
    * is the responsibility of the caller to later delete the subscription.
-   *
-   * @throws IOException
    */
   public SubscriptionPath createRandomSubscription(
       ProjectPath project, TopicPath topic, int ackDeadlineSeconds) throws IOException {
@@ -526,23 +521,17 @@ public abstract class PubsubClient implements Closeable {
 
   /**
    * Delete {@code subscription}.
-   *
-   * @throws IOException
    */
   public abstract void deleteSubscription(SubscriptionPath subscription) throws IOException;
 
   /**
    * Return a list of subscriptions for {@code topic} in {@code project}.
-   *
-   * @throws IOException
    */
   public abstract List<SubscriptionPath> listSubscriptions(ProjectPath project, TopicPath topic)
       throws IOException;
 
   /**
    * Return the ack deadline, in seconds, for {@code subscription}.
-   *
-   * @throws IOException
    */
   public abstract int ackDeadlineSeconds(SubscriptionPath subscription) throws IOException;
 

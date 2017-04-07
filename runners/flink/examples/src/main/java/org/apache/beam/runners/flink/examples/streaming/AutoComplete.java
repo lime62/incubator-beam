@@ -53,11 +53,9 @@ import org.joda.time.Duration;
 
 /**
  * To run the example, first open a socket on a terminal by executing the command:
- * <li>
- *     <li>
- *     <code>nc -lk 9999</code>
- *     </li>
- * </li>
+ * <ul>
+ *   <li><code>nc -lk 9999</code>
+ * </ul>
  * and then launch the example. Now whatever you type in the terminal is going to be
  * the input to the program.
  * */
@@ -84,10 +82,10 @@ public class AutoComplete {
     }
 
     @Override
-    public PCollection<KV<String, List<CompletionCandidate>>> apply(PCollection<String> input) {
+    public PCollection<KV<String, List<CompletionCandidate>>> expand(PCollection<String> input) {
       PCollection<CompletionCandidate> candidates = input
         // First count how often each token appears.
-        .apply(new Count.PerElement<String>())
+        .apply(Count.<String>perElement())
 
         // Map the KV outputs of Count into our own CompletionCandiate class.
         .apply("CreateCompletionCandidates", ParDo.of(
@@ -131,7 +129,7 @@ public class AutoComplete {
     }
 
     @Override
-    public PCollection<KV<String, List<CompletionCandidate>>> apply(
+    public PCollection<KV<String, List<CompletionCandidate>>> expand(
         PCollection<CompletionCandidate> input) {
       return input
         // For each completion candidate, map it to all prefixes.
@@ -155,7 +153,7 @@ public class AutoComplete {
   /**
    * Cheaper but higher latency.
    *
-   * <p> Returns two PCollections, the first is top prefixes of size greater
+   * <p>Returns two PCollections, the first is top prefixes of size greater
    * than minPrefix, and the second is top prefixes of size exactly
    * minPrefix.
    */
@@ -194,7 +192,7 @@ public class AutoComplete {
     }
 
     @Override
-    public PCollectionList<KV<String, List<CompletionCandidate>>> apply(
+    public PCollectionList<KV<String, List<CompletionCandidate>>> expand(
           PCollection<CompletionCandidate> input) {
         if (minPrefix > 10) {
           // Base case, partitioning to return the output in the expected format.
@@ -316,7 +314,7 @@ public class AutoComplete {
 
   static class ExtractWordsFn extends DoFn<String, String> {
     private final Aggregator<Long, Long> emptyLines =
-            createAggregator("emptyLines", new Sum.SumLongFn());
+            createAggregator("emptyLines", Sum.ofLongs());
 
     @ProcessElement
     public void processElement(ProcessContext c) {
@@ -362,7 +360,7 @@ public class AutoComplete {
   /**
    * Options supported by this class.
    *
-   * <p> Inherits standard Dataflow configuration options.
+   * <p>Inherits standard Dataflow configuration options.
    */
   private interface Options extends WindowedWordCount.StreamingWordCountOptions {
     @Description("Whether to use the recursive algorithm")

@@ -16,55 +16,65 @@
  * limitations under the License.
  */
 
-
 package org.apache.beam.runners.spark.translation;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static org.apache.beam.runners.spark.io.hadoop.ShardNameBuilder.getOutputDirectory;
 import static org.apache.beam.runners.spark.io.hadoop.ShardNameBuilder.getOutputFilePrefix;
 import static org.apache.beam.runners.spark.io.hadoop.ShardNameBuilder.getOutputFileTemplate;
 import static org.apache.beam.runners.spark.io.hadoop.ShardNameBuilder.replaceShardCount;
+import static org.apache.beam.runners.spark.translation.TranslationUtils.rejectSplittable;
+import static org.apache.beam.runners.spark.translation.TranslationUtils.rejectStateAndTimers;
 
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import java.io.IOException;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import org.apache.avro.mapred.AvroKey;
 import org.apache.avro.mapreduce.AvroJob;
 import org.apache.avro.mapreduce.AvroKeyInputFormat;
-import org.apache.beam.runners.core.AssignWindowsDoFn;
-import org.apache.beam.runners.core.GroupByKeyViaGroupByKeyOnly.GroupAlsoByWindow;
-import org.apache.beam.runners.core.GroupByKeyViaGroupByKeyOnly.GroupByKeyOnly;
-import org.apache.beam.runners.spark.aggregators.AccumulatorSingleton;
+import org.apache.beam.runners.core.SystemReduceFn;
 import org.apache.beam.runners.spark.aggregators.NamedAggregators;
+import org.apache.beam.runners.spark.aggregators.SparkAggregators;
 import org.apache.beam.runners.spark.coders.CoderHelpers;
 import org.apache.beam.runners.spark.io.SourceRDD;
 import org.apache.beam.runners.spark.io.hadoop.HadoopIO;
 import org.apache.beam.runners.spark.io.hadoop.ShardNameTemplateHelper;
 import org.apache.beam.runners.spark.io.hadoop.TemplatedAvroKeyOutputFormat;
 import org.apache.beam.runners.spark.io.hadoop.TemplatedTextOutputFormat;
-import org.apache.beam.runners.spark.util.BroadcastHelper;
+import org.apache.beam.runners.spark.metrics.MetricsAccumulator;
+import org.apache.beam.runners.spark.metrics.SparkMetricsContainer;
+import org.apache.beam.runners.spark.util.SideInputBroadcast;
 import org.apache.beam.sdk.coders.CannotProvideCoderException;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.KvCoder;
+import org.apache.beam.sdk.coders.StringUtf8Coder;
 import org.apache.beam.sdk.io.AvroIO;
 import org.apache.beam.sdk.io.Read;
 import org.apache.beam.sdk.io.TextIO;
 import org.apache.beam.sdk.transforms.Combine;
+import org.apache.beam.sdk.transforms.CombineWithContext;
 import org.apache.beam.sdk.transforms.Create;
+import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.Flatten;
-import org.apache.beam.sdk.transforms.OldDoFn;
+import org.apache.beam.sdk.transforms.GroupByKey;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.transforms.View;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
 import org.apache.beam.sdk.transforms.windowing.Window;
 import org.apache.beam.sdk.transforms.windowing.WindowFn;
+import org.apache.beam.sdk.util.CombineFnUtil;
+import org.apache.beam.sdk.util.Reshuffle;
 import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.beam.sdk.util.WindowingStrategy;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
-import org.apache.beam.sdk.values.PCollectionList;
-import org.apache.beam.sdk.values.PCollectionTuple;
+import org.apache.beam.sdk.values.PCollectionView;
+import org.apache.beam.sdk.values.TaggedPValue;
 import org.apache.beam.sdk.values.TupleTag;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.io.NullWritable;
@@ -74,11 +84,9 @@ import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 import org.apache.spark.Accumulator;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
-import org.apache.spark.api.java.JavaRDDLike;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.Function;
 import org.apache.spark.api.java.function.PairFunction;
-
 import scala.Tuple2;
 
 
@@ -90,152 +98,228 @@ public final class TransformTranslator {
   private TransformTranslator() {
   }
 
-  private static <T> TransformEvaluator<Flatten.FlattenPCollectionList<T>> flattenPColl() {
-    return new TransformEvaluator<Flatten.FlattenPCollectionList<T>>() {
+  private static <T> TransformEvaluator<Flatten.PCollections<T>> flattenPColl() {
+    return new TransformEvaluator<Flatten.PCollections<T>>() {
       @SuppressWarnings("unchecked")
       @Override
-      public void evaluate(Flatten.FlattenPCollectionList<T> transform, EvaluationContext context) {
-        PCollectionList<T> pcs = context.getInput(transform);
-        JavaRDD<WindowedValue<T>>[] rdds = new JavaRDD[pcs.size()];
-        for (int i = 0; i < rdds.length; i++) {
-          rdds[i] = (JavaRDD<WindowedValue<T>>) context.getRDD(pcs.get(i));
+      public void evaluate(Flatten.PCollections<T> transform, EvaluationContext context) {
+        List<TaggedPValue> pcs = context.getInputs(transform);
+        JavaRDD<WindowedValue<T>> unionRDD;
+        if (pcs.size() == 0) {
+          unionRDD = context.getSparkContext().emptyRDD();
+        } else {
+          JavaRDD<WindowedValue<T>>[] rdds = new JavaRDD[pcs.size()];
+          for (int i = 0; i < rdds.length; i++) {
+            checkArgument(
+                pcs.get(i).getValue() instanceof PCollection,
+                "Flatten had non-PCollection value in input: %s of type %s",
+                pcs.get(i).getValue(),
+                pcs.get(i).getValue().getClass().getSimpleName());
+            rdds[i] = ((BoundedDataset<T>) context.borrowDataset(pcs.get(i).getValue())).getRDD();
+          }
+          unionRDD = context.getSparkContext().union(rdds);
         }
-        JavaRDD<WindowedValue<T>> rdd = context.getSparkContext().union(rdds);
-        context.setOutputRDD(transform, rdd);
+        context.putDataset(transform, new BoundedDataset<>(unionRDD));
       }
     };
   }
 
-  private static <K, V> TransformEvaluator<GroupByKeyOnly<K, V>> gbko() {
-    return new TransformEvaluator<GroupByKeyOnly<K, V>>() {
+  private static <K, V, W extends BoundedWindow> TransformEvaluator<GroupByKey<K, V>> groupByKey() {
+    return new TransformEvaluator<GroupByKey<K, V>>() {
       @Override
-      public void evaluate(GroupByKeyOnly<K, V> transform, EvaluationContext context) {
+      public void evaluate(GroupByKey<K, V> transform, EvaluationContext context) {
         @SuppressWarnings("unchecked")
         JavaRDD<WindowedValue<KV<K, V>>> inRDD =
-            (JavaRDD<WindowedValue<KV<K, V>>>) context.getInputRDD(transform);
-
+            ((BoundedDataset<KV<K, V>>) context.borrowDataset(transform)).getRDD();
         @SuppressWarnings("unchecked")
         final KvCoder<K, V> coder = (KvCoder<K, V>) context.getInput(transform).getCoder();
-
-        context.setOutputRDD(transform, GroupCombineFunctions.groupByKeyOnly(inRDD, coder));
-      }
-    };
-  }
-
-  private static <K, V, W extends BoundedWindow>
-      TransformEvaluator<GroupAlsoByWindow<K, V>> gabw() {
-    return new TransformEvaluator<GroupAlsoByWindow<K, V>>() {
-      @Override
-      public void evaluate(GroupAlsoByWindow<K, V> transform, EvaluationContext context) {
-        @SuppressWarnings("unchecked")
-        JavaRDD<WindowedValue<KV<K, Iterable<WindowedValue<V>>>>> inRDD =
-            (JavaRDD<WindowedValue<KV<K, Iterable<WindowedValue<V>>>>>)
-                context.getInputRDD(transform);
-
-        @SuppressWarnings("unchecked")
-        final KvCoder<K, Iterable<WindowedValue<V>>> inputKvCoder =
-            (KvCoder<K, Iterable<WindowedValue<V>>>) context.getInput(transform).getCoder();
-
         final Accumulator<NamedAggregators> accum =
-            AccumulatorSingleton.getInstance(context.getSparkContext());
+            SparkAggregators.getNamedAggregators(context.getSparkContext());
+        @SuppressWarnings("unchecked")
+        final WindowingStrategy<?, W> windowingStrategy =
+            (WindowingStrategy<?, W>) context.getInput(transform).getWindowingStrategy();
+        @SuppressWarnings("unchecked")
+        final WindowFn<Object, W> windowFn = (WindowFn<Object, W>) windowingStrategy.getWindowFn();
 
-        context.setOutputRDD(transform, GroupCombineFunctions.groupAlsoByWindow(inRDD, transform,
-            context.getRuntimeContext(), accum, inputKvCoder));
+        //--- coders.
+        final Coder<K> keyCoder = coder.getKeyCoder();
+        final WindowedValue.WindowedValueCoder<V> wvCoder =
+            WindowedValue.FullWindowedValueCoder.of(coder.getValueCoder(), windowFn.windowCoder());
+
+        //--- group by key only.
+        JavaRDD<WindowedValue<KV<K, Iterable<WindowedValue<V>>>>> groupedByKey =
+            GroupCombineFunctions.groupByKeyOnly(inRDD, keyCoder, wvCoder);
+
+        //--- now group also by window.
+        // for batch, GroupAlsoByWindow uses an in-memory StateInternals.
+        JavaRDD<WindowedValue<KV<K, Iterable<V>>>> groupedAlsoByWindow = groupedByKey.flatMap(
+            new SparkGroupAlsoByWindowViaOutputBufferFn<>(
+                windowingStrategy,
+                new TranslationUtils.InMemoryStateInternalsFactory<K>(),
+                SystemReduceFn.<K, V, W>buffering(coder.getValueCoder()),
+                context.getRuntimeContext(),
+                accum));
+
+        context.putDataset(transform, new BoundedDataset<>(groupedAlsoByWindow));
       }
     };
   }
 
   private static <K, InputT, OutputT> TransformEvaluator<Combine.GroupedValues<K, InputT, OutputT>>
-  grouped() {
-    return new TransformEvaluator<Combine.GroupedValues<K, InputT, OutputT>>() {
-      @Override
-      public void evaluate(Combine.GroupedValues<K, InputT, OutputT> transform,
-                           EvaluationContext context) {
-        @SuppressWarnings("unchecked")
-        JavaRDDLike<WindowedValue<KV<K, Iterable<InputT>>>, ?> inRDD =
-            (JavaRDDLike<WindowedValue<KV<K, Iterable<InputT>>>, ?>)
-                context.getInputRDD(transform);
-        context.setOutputRDD(transform, inRDD.map(
-            new TranslationUtils.CombineGroupedValues<>(transform)));
-      }
-    };
+      combineGrouped() {
+          return new TransformEvaluator<Combine.GroupedValues<K, InputT, OutputT>>() {
+            @Override
+            public void evaluate(
+                Combine.GroupedValues<K, InputT, OutputT> transform,
+                EvaluationContext context) {
+              @SuppressWarnings("unchecked")
+              CombineWithContext.KeyedCombineFnWithContext<K, InputT, ?, OutputT> combineFn =
+                  (CombineWithContext.KeyedCombineFnWithContext<K, InputT, ?, OutputT>)
+                      CombineFnUtil.toFnWithContext(transform.getFn());
+              final SparkKeyedCombineFn<K, InputT, ?, OutputT> sparkCombineFn =
+                  new SparkKeyedCombineFn<>(combineFn, context.getRuntimeContext(),
+                      TranslationUtils.getSideInputs(transform.getSideInputs(), context),
+                          context.getInput(transform).getWindowingStrategy());
+
+              @SuppressWarnings("unchecked")
+              JavaRDD<WindowedValue<KV<K, Iterable<InputT>>>> inRDD =
+                  ((BoundedDataset<KV<K, Iterable<InputT>>>) context.borrowDataset(transform))
+                      .getRDD();
+
+              JavaRDD<WindowedValue<KV<K, OutputT>>> outRDD = inRDD.map(
+                   new Function<WindowedValue<KV<K, Iterable<InputT>>>,
+                       WindowedValue<KV<K, OutputT>>>() {
+                         @Override
+                         public WindowedValue<KV<K, OutputT>> call(
+                             WindowedValue<KV<K, Iterable<InputT>>> in) throws Exception {
+                               return WindowedValue.of(
+                                   KV.of(in.getValue().getKey(), sparkCombineFn.apply(in)),
+                                   in.getTimestamp(),
+                                   in.getWindows(),
+                                   in.getPane());
+                             }
+                       });
+               context.putDataset(transform, new BoundedDataset<>(outRDD));
+            }
+          };
   }
 
   private static <InputT, AccumT, OutputT> TransformEvaluator<Combine.Globally<InputT, OutputT>>
-  combineGlobally() {
-    return new TransformEvaluator<Combine.Globally<InputT, OutputT>>() {
+      combineGlobally() {
+        return new TransformEvaluator<Combine.Globally<InputT, OutputT>>() {
 
-      @Override
-      public void evaluate(Combine.Globally<InputT, OutputT> transform, EvaluationContext context) {
-        @SuppressWarnings("unchecked")
-        JavaRDD<WindowedValue<InputT>> inRdd =
-            (JavaRDD<WindowedValue<InputT>>) context.getInputRDD(transform);
+          @Override
+          public void evaluate(
+              Combine.Globally<InputT, OutputT> transform,
+              EvaluationContext context) {
+            final PCollection<InputT> input = context.getInput(transform);
+            final Coder<InputT> iCoder = context.getInput(transform).getCoder();
+            final Coder<OutputT> oCoder = context.getOutput(transform).getCoder();
+            final WindowingStrategy<?, ?> windowingStrategy = input.getWindowingStrategy();
+            @SuppressWarnings("unchecked")
+            final CombineWithContext.CombineFnWithContext<InputT, AccumT, OutputT> combineFn =
+                (CombineWithContext.CombineFnWithContext<InputT, AccumT, OutputT>)
+                    CombineFnUtil.toFnWithContext(transform.getFn());
+            final WindowedValue.FullWindowedValueCoder<OutputT> wvoCoder =
+                WindowedValue.FullWindowedValueCoder.of(oCoder,
+                    windowingStrategy.getWindowFn().windowCoder());
+            final SparkRuntimeContext runtimeContext = context.getRuntimeContext();
+            final boolean hasDefault = transform.isInsertDefault();
 
-        @SuppressWarnings("unchecked")
-        final Combine.CombineFn<InputT, AccumT, OutputT> globally =
-            (Combine.CombineFn<InputT, AccumT, OutputT>) transform.getFn();
+            final SparkGlobalCombineFn<InputT, AccumT, OutputT> sparkCombineFn =
+                new SparkGlobalCombineFn<>(
+                    combineFn,
+                    runtimeContext,
+                    TranslationUtils.getSideInputs(transform.getSideInputs(), context),
+                    windowingStrategy);
+            final Coder<AccumT> aCoder;
+            try {
+              aCoder = combineFn.getAccumulatorCoder(runtimeContext.getCoderRegistry(), iCoder);
+            } catch (CannotProvideCoderException e) {
+              throw new IllegalStateException("Could not determine coder for accumulator", e);
+            }
 
-        final Coder<InputT> iCoder = context.getInput(transform).getCoder();
-        final Coder<AccumT> aCoder;
-        try {
-          aCoder = globally.getAccumulatorCoder(
-              context.getPipeline().getCoderRegistry(), iCoder);
-        } catch (CannotProvideCoderException e) {
-          throw new IllegalStateException("Could not determine coder for accumulator", e);
-        }
+            @SuppressWarnings("unchecked")
+            JavaRDD<WindowedValue<InputT>> inRdd =
+                ((BoundedDataset<InputT>) context.borrowDataset(transform)).getRDD();
 
-        final Coder<OutputT> oCoder = context.getOutput(transform).getCoder();
-        JavaRDD<byte[]> outRdd = context.getSparkContext().parallelize(
-            // don't use Guava's ImmutableList.of as output may be null
-            CoderHelpers.toByteArrays(Collections.singleton(
-                GroupCombineFunctions.combineGlobally(inRdd, globally, iCoder, aCoder)), oCoder));
-        context.setOutputRDD(transform, outRdd.map(CoderHelpers.fromByteFunction(oCoder))
-            .map(WindowingHelpers.<OutputT>windowFunction()));
-      }
-    };
+            JavaRDD<WindowedValue<OutputT>> outRdd;
+            // handle empty input RDD, which will naturally skip the entire execution
+            // as Spark will not run on empty RDDs.
+            if (inRdd.isEmpty()) {
+              JavaSparkContext jsc = new JavaSparkContext(inRdd.context());
+              if (hasDefault) {
+                OutputT defaultValue = combineFn.defaultValue();
+                outRdd = jsc
+                    .parallelize(Lists.newArrayList(CoderHelpers.toByteArray(defaultValue, oCoder)))
+                    .map(CoderHelpers.fromByteFunction(oCoder))
+                    .map(WindowingHelpers.<OutputT>windowFunction());
+              } else {
+                outRdd = jsc.emptyRDD();
+              }
+            } else {
+              Iterable<WindowedValue<AccumT>> accumulated = GroupCombineFunctions.combineGlobally(
+                  inRdd, sparkCombineFn, iCoder, aCoder, windowingStrategy);
+              Iterable<WindowedValue<OutputT>> output = sparkCombineFn.extractOutput(accumulated);
+              outRdd = context.getSparkContext()
+                  .parallelize(CoderHelpers.toByteArrays(output, wvoCoder))
+                  .map(CoderHelpers.fromByteFunction(wvoCoder));
+            }
+            context.putDataset(transform, new BoundedDataset<>(outRdd));
+          }
+        };
   }
 
   private static <K, InputT, AccumT, OutputT>
   TransformEvaluator<Combine.PerKey<K, InputT, OutputT>> combinePerKey() {
     return new TransformEvaluator<Combine.PerKey<K, InputT, OutputT>>() {
       @Override
-      public void evaluate(Combine.PerKey<K, InputT, OutputT> transform,
-                           EvaluationContext context) {
+      public void evaluate(
+          Combine.PerKey<K, InputT, OutputT> transform,
+          EvaluationContext context) {
+        final PCollection<KV<K, InputT>> input = context.getInput(transform);
+        // serializable arguments to pass.
         @SuppressWarnings("unchecked")
-        final Combine.KeyedCombineFn<K, InputT, AccumT, OutputT> keyed =
-            (Combine.KeyedCombineFn<K, InputT, AccumT, OutputT>) transform.getFn();
-
+        final KvCoder<K, InputT> inputCoder =
+            (KvCoder<K, InputT>) context.getInput(transform).getCoder();
         @SuppressWarnings("unchecked")
-        KvCoder<K, InputT> inputCoder = (KvCoder<K, InputT>)
-            context.getInput(transform).getCoder();
-        Coder<K> keyCoder = inputCoder.getKeyCoder();
-        Coder<InputT> viCoder = inputCoder.getValueCoder();
-        Coder<AccumT> vaCoder;
+        final CombineWithContext.KeyedCombineFnWithContext<K, InputT, AccumT, OutputT> combineFn =
+            (CombineWithContext.KeyedCombineFnWithContext<K, InputT, AccumT, OutputT>)
+                CombineFnUtil.toFnWithContext(transform.getFn());
+        final WindowingStrategy<?, ?> windowingStrategy = input.getWindowingStrategy();
+        final SparkRuntimeContext runtimeContext = context.getRuntimeContext();
+        final Map<TupleTag<?>, KV<WindowingStrategy<?, ?>, SideInputBroadcast<?>>> sideInputs =
+            TranslationUtils.getSideInputs(transform.getSideInputs(), context);
+        final SparkKeyedCombineFn<K, InputT, AccumT, OutputT> sparkCombineFn =
+            new SparkKeyedCombineFn<>(combineFn, runtimeContext, sideInputs, windowingStrategy);
+        final Coder<AccumT> vaCoder;
         try {
-          vaCoder = keyed.getAccumulatorCoder(
-              context.getPipeline().getCoderRegistry(), keyCoder, viCoder);
+          vaCoder = combineFn.getAccumulatorCoder(runtimeContext.getCoderRegistry(),
+              inputCoder.getKeyCoder(), inputCoder.getValueCoder());
         } catch (CannotProvideCoderException e) {
           throw new IllegalStateException("Could not determine coder for accumulator", e);
         }
-        Coder<KV<K, InputT>> kviCoder = KvCoder.of(keyCoder, viCoder);
-        Coder<KV<K, AccumT>> kvaCoder = KvCoder.of(keyCoder, vaCoder);
-        //-- windowed coders
-        final WindowedValue.FullWindowedValueCoder<K> wkCoder =
-            WindowedValue.FullWindowedValueCoder.of(keyCoder,
-                context.getInput(transform).getWindowingStrategy().getWindowFn().windowCoder());
-        final WindowedValue.FullWindowedValueCoder<KV<K, InputT>> wkviCoder =
-            WindowedValue.FullWindowedValueCoder.of(kviCoder,
-                context.getInput(transform).getWindowingStrategy().getWindowFn().windowCoder());
-        final WindowedValue.FullWindowedValueCoder<KV<K, AccumT>> wkvaCoder =
-            WindowedValue.FullWindowedValueCoder.of(kvaCoder,
-                context.getInput(transform).getWindowingStrategy().getWindowFn().windowCoder());
 
         @SuppressWarnings("unchecked")
         JavaRDD<WindowedValue<KV<K, InputT>>> inRdd =
-                (JavaRDD<WindowedValue<KV<K, InputT>>>) context.getInputRDD(transform);
+            ((BoundedDataset<KV<K, InputT>>) context.borrowDataset(transform)).getRDD();
 
-        context.setOutputRDD(transform, GroupCombineFunctions.combinePerKey(inRdd, keyed, wkCoder,
-            wkviCoder, wkvaCoder));
+        JavaPairRDD<K, Iterable<WindowedValue<KV<K, AccumT>>>> accumulatePerKey =
+            GroupCombineFunctions.combinePerKey(inRdd, sparkCombineFn, inputCoder.getKeyCoder(),
+                inputCoder.getValueCoder(), vaCoder, windowingStrategy);
+
+        JavaRDD<WindowedValue<KV<K, OutputT>>> outRdd =
+            accumulatePerKey.flatMapValues(new Function<Iterable<WindowedValue<KV<K, AccumT>>>,
+                Iterable<WindowedValue<OutputT>>>() {
+                  @Override
+                  public Iterable<WindowedValue<OutputT>> call(
+                      Iterable<WindowedValue<KV<K, AccumT>>> iter) throws Exception {
+                        return sparkCombineFn.extractOutput(iter);
+                      }
+                }).map(TranslationUtils.<K, WindowedValue<OutputT>>fromPairFunction())
+                  .map(TranslationUtils.<K, OutputT>toKVByWindowInValue());
+
+        context.putDataset(transform, new BoundedDataset<>(outRdd));
       }
     };
   }
@@ -244,16 +328,25 @@ public final class TransformTranslator {
     return new TransformEvaluator<ParDo.Bound<InputT, OutputT>>() {
       @Override
       public void evaluate(ParDo.Bound<InputT, OutputT> transform, EvaluationContext context) {
+        String stepName = context.getCurrentTransform().getFullName();
+        DoFn<InputT, OutputT> doFn = transform.getFn();
+        rejectSplittable(doFn);
+        rejectStateAndTimers(doFn);
         @SuppressWarnings("unchecked")
-        JavaRDDLike<WindowedValue<InputT>, ?> inRDD =
-            (JavaRDDLike<WindowedValue<InputT>, ?>) context.getInputRDD(transform);
-        Accumulator<NamedAggregators> accum =
-            AccumulatorSingleton.getInstance(context.getSparkContext());
-        Map<TupleTag<?>, BroadcastHelper<?>> sideInputs =
+        JavaRDD<WindowedValue<InputT>> inRDD =
+            ((BoundedDataset<InputT>) context.borrowDataset(transform)).getRDD();
+        WindowingStrategy<?, ?> windowingStrategy =
+            context.getInput(transform).getWindowingStrategy();
+        JavaSparkContext jsc = context.getSparkContext();
+        Accumulator<NamedAggregators> aggAccum =
+            SparkAggregators.getNamedAggregators(jsc);
+        Accumulator<SparkMetricsContainer> metricsAccum =
+            MetricsAccumulator.getInstance();
+        Map<TupleTag<?>, KV<WindowingStrategy<?, ?>, SideInputBroadcast<?>>> sideInputs =
             TranslationUtils.getSideInputs(transform.getSideInputs(), context);
-        context.setOutputRDD(transform,
-            inRDD.mapPartitions(new DoFnFunction<>(accum, transform.getFn(),
-                context.getRuntimeContext(), sideInputs)));
+        context.putDataset(transform,
+            new BoundedDataset<>(inRDD.mapPartitions(new DoFnFunction<>(aggAccum, metricsAccum,
+                stepName, doFn, context.getRuntimeContext(), sideInputs, windowingStrategy))));
       }
     };
   }
@@ -263,52 +356,61 @@ public final class TransformTranslator {
     return new TransformEvaluator<ParDo.BoundMulti<InputT, OutputT>>() {
       @Override
       public void evaluate(ParDo.BoundMulti<InputT, OutputT> transform, EvaluationContext context) {
+        String stepName = context.getCurrentTransform().getFullName();
+        DoFn<InputT, OutputT> doFn = transform.getFn();
+        rejectSplittable(doFn);
+        rejectStateAndTimers(doFn);
         @SuppressWarnings("unchecked")
-        JavaRDDLike<WindowedValue<InputT>, ?> inRDD =
-            (JavaRDDLike<WindowedValue<InputT>, ?>) context.getInputRDD(transform);
-        Accumulator<NamedAggregators> accum =
-            AccumulatorSingleton.getInstance(context.getSparkContext());
+        JavaRDD<WindowedValue<InputT>> inRDD =
+            ((BoundedDataset<InputT>) context.borrowDataset(transform)).getRDD();
+        WindowingStrategy<?, ?> windowingStrategy =
+            context.getInput(transform).getWindowingStrategy();
+        JavaSparkContext jsc = context.getSparkContext();
+        Accumulator<NamedAggregators> aggAccum =
+            SparkAggregators.getNamedAggregators(jsc);
+        Accumulator<SparkMetricsContainer> metricsAccum =
+            MetricsAccumulator.getInstance();
         JavaPairRDD<TupleTag<?>, WindowedValue<?>> all = inRDD
             .mapPartitionsToPair(
-                new MultiDoFnFunction<>(accum, transform.getFn(), context.getRuntimeContext(),
-                transform.getMainOutputTag(), TranslationUtils.getSideInputs(
-                    transform.getSideInputs(), context)))
-                        .cache();
-        PCollectionTuple pct = context.getOutput(transform);
-        for (Map.Entry<TupleTag<?>, PCollection<?>> e : pct.getAll().entrySet()) {
+                new MultiDoFnFunction<>(aggAccum, metricsAccum, stepName, doFn,
+                    context.getRuntimeContext(), transform.getMainOutputTag(),
+                    TranslationUtils.getSideInputs(transform.getSideInputs(), context),
+                    windowingStrategy)).cache();
+        List<TaggedPValue> pct = context.getOutputs(transform);
+        for (TaggedPValue e : pct) {
           @SuppressWarnings("unchecked")
           JavaPairRDD<TupleTag<?>, WindowedValue<?>> filtered =
-              all.filter(new TranslationUtils.TupleTagFilter(e.getKey()));
+              all.filter(new TranslationUtils.TupleTagFilter(e.getTag()));
           @SuppressWarnings("unchecked")
           // Object is the best we can do since different outputs can have different tags
           JavaRDD<WindowedValue<Object>> values =
               (JavaRDD<WindowedValue<Object>>) (JavaRDD<?>) filtered.values();
-          context.setRDD(e.getValue(), values);
+          context.putDataset(e.getValue(), new BoundedDataset<>(values));
         }
       }
     };
   }
 
 
-  private static <T> TransformEvaluator<TextIO.Read.Bound<T>> readText() {
-    return new TransformEvaluator<TextIO.Read.Bound<T>>() {
+  private static <T> TransformEvaluator<TextIO.Read.Bound> readText() {
+    return new TransformEvaluator<TextIO.Read.Bound>() {
       @Override
-      public void evaluate(TextIO.Read.Bound<T> transform, EvaluationContext context) {
+      public void evaluate(TextIO.Read.Bound transform, EvaluationContext context) {
         String pattern = transform.getFilepattern();
         JavaRDD<WindowedValue<String>> rdd = context.getSparkContext().textFile(pattern)
-                .map(WindowingHelpers.<String>windowFunction());
-        context.setOutputRDD(transform, rdd);
+            .map(WindowingHelpers.<String>windowFunction());
+        context.putDataset(transform, new BoundedDataset<>(rdd));
       }
     };
   }
 
-  private static <T> TransformEvaluator<TextIO.Write.Bound<T>> writeText() {
-    return new TransformEvaluator<TextIO.Write.Bound<T>>() {
+  private static <T> TransformEvaluator<TextIO.Write.Bound> writeText() {
+    return new TransformEvaluator<TextIO.Write.Bound>() {
       @Override
-      public void evaluate(TextIO.Write.Bound<T> transform, EvaluationContext context) {
+      public void evaluate(TextIO.Write.Bound transform, EvaluationContext context) {
         @SuppressWarnings("unchecked")
         JavaPairRDD<T, Void> last =
-            ((JavaRDDLike<WindowedValue<T>, ?>) context.getInputRDD(transform))
+            ((BoundedDataset<T>) context.borrowDataset(transform)).getRDD()
             .map(WindowingHelpers.<T>unwindowFunction())
             .mapToPair(new PairFunction<T, T,
                     Void>() {
@@ -346,7 +448,7 @@ public final class TransformTranslator {
                 return key.datum();
               }
             }).map(WindowingHelpers.<T>windowFunction());
-        context.setOutputRDD(transform, rdd);
+        context.putDataset(transform, new BoundedDataset<>(rdd));
       }
     };
   }
@@ -364,7 +466,7 @@ public final class TransformTranslator {
         AvroJob.setOutputKeySchema(job, transform.getSchema());
         @SuppressWarnings("unchecked")
         JavaPairRDD<AvroKey<T>, NullWritable> last =
-            ((JavaRDDLike<WindowedValue<T>, ?>) context.getInputRDD(transform))
+            ((BoundedDataset<T>) context.borrowDataset(transform)).getRDD()
             .map(WindowingHelpers.<T>unwindowFunction())
             .mapToPair(new PairFunction<T, AvroKey<T>, NullWritable>() {
               @Override
@@ -392,7 +494,7 @@ public final class TransformTranslator {
         JavaRDD<WindowedValue<T>> input = new SourceRDD.Bounded<>(
             jsc.sc(), transform.getSource(), runtimeContext).toJavaRDD();
         // cache to avoid re-evaluation of the source by Spark's lazy DAG evaluation.
-        context.setOutputRDD(transform, input.cache());
+        context.putDataset(transform, new BoundedDataset<>(input.cache()));
       }
     };
   }
@@ -403,7 +505,7 @@ public final class TransformTranslator {
       public void evaluate(HadoopIO.Read.Bound<K, V> transform, EvaluationContext context) {
         String pattern = transform.getFilepattern();
         JavaSparkContext jsc = context.getSparkContext();
-        @SuppressWarnings ("unchecked")
+        @SuppressWarnings("unchecked")
         JavaPairRDD<K, V> file = jsc.newAPIHadoopFile(pattern,
             transform.getFormatClass(),
             transform.getKeyClass(), transform.getValueClass(),
@@ -415,7 +517,7 @@ public final class TransformTranslator {
             return KV.of(t2._1(), t2._2());
           }
         }).map(WindowingHelpers.<KV<K, V>>windowFunction());
-        context.setOutputRDD(transform, rdd);
+        context.putDataset(transform, new BoundedDataset<>(rdd));
       }
     };
   }
@@ -425,8 +527,8 @@ public final class TransformTranslator {
       @Override
       public void evaluate(HadoopIO.Write.Bound<K, V> transform, EvaluationContext context) {
         @SuppressWarnings("unchecked")
-        JavaPairRDD<K, V> last = ((JavaRDDLike<WindowedValue<KV<K, V>>, ?>) context
-            .getInputRDD(transform))
+        JavaPairRDD<K, V> last = ((BoundedDataset<KV<K, V>>) context.borrowDataset(transform))
+            .getRDD()
             .map(WindowingHelpers.<KV<K, V>>unwindowFunction())
             .mapToPair(new PairFunction<KV<K, V>, K, V>() {
               @Override
@@ -502,25 +604,19 @@ public final class TransformTranslator {
     rdd.saveAsNewAPIHadoopFile(outputDir, keyClass, valueClass, formatClass, conf);
   }
 
-  private static <T, W extends BoundedWindow> TransformEvaluator<Window.Bound<T>> window() {
-    return new TransformEvaluator<Window.Bound<T>>() {
+  private static <T, W extends BoundedWindow> TransformEvaluator<Window.Assign<T>> window() {
+    return new TransformEvaluator<Window.Assign<T>>() {
       @Override
-      public void evaluate(Window.Bound<T> transform, EvaluationContext context) {
+      public void evaluate(Window.Assign<T> transform, EvaluationContext context) {
         @SuppressWarnings("unchecked")
-        JavaRDDLike<WindowedValue<T>, ?> inRDD =
-            (JavaRDDLike<WindowedValue<T>, ?>) context.getInputRDD(transform);
+        JavaRDD<WindowedValue<T>> inRDD =
+            ((BoundedDataset<T>) context.borrowDataset(transform)).getRDD();
 
         if (TranslationUtils.skipAssignWindows(transform, context)) {
-          context.setOutputRDD(transform, inRDD);
+          context.putDataset(transform, new BoundedDataset<>(inRDD));
         } else {
-          @SuppressWarnings("unchecked")
-          WindowFn<? super T, W> windowFn = (WindowFn<? super T, W>) transform.getWindowFn();
-          OldDoFn<T, T> addWindowsDoFn = new AssignWindowsDoFn<>(windowFn);
-          Accumulator<NamedAggregators> accum =
-              AccumulatorSingleton.getInstance(context.getSparkContext());
-          context.setOutputRDD(transform,
-              inRDD.mapPartitions(new DoFnFunction<>(accum, addWindowsDoFn,
-                  context.getRuntimeContext(), null)));
+          context.putDataset(transform, new BoundedDataset<>(
+              inRDD.map(new SparkAssignWindowFn<>(transform.getWindowFn()))));
         }
       }
     };
@@ -534,7 +630,7 @@ public final class TransformTranslator {
         // Use a coder to convert the objects in the PCollection to byte arrays, so they
         // can be transferred over the network.
         Coder<T> coder = context.getOutput(transform).getCoder();
-        context.setOutputRDDFromValues(transform, elems, coder);
+        context.putBoundedDatasetFromValues(transform, elems, coder);
       }
     };
   }
@@ -544,8 +640,14 @@ public final class TransformTranslator {
       @Override
       public void evaluate(View.AsSingleton<T> transform, EvaluationContext context) {
         Iterable<? extends WindowedValue<?>> iter =
-                context.getWindowedValues(context.getInput(transform));
-        context.setPView(context.getOutput(transform), iter);
+        context.getWindowedValues(context.getInput(transform));
+        PCollectionView<T> output = context.getOutput(transform);
+        Coder<Iterable<WindowedValue<?>>> coderInternal = output.getCoderInternal();
+
+        @SuppressWarnings("unchecked")
+        Iterable<WindowedValue<?>> iterCast =  (Iterable<WindowedValue<?>>) iter;
+
+        context.putPView(output, iterCast, coderInternal);
       }
     };
   }
@@ -555,8 +657,14 @@ public final class TransformTranslator {
       @Override
       public void evaluate(View.AsIterable<T> transform, EvaluationContext context) {
         Iterable<? extends WindowedValue<?>> iter =
-                context.getWindowedValues(context.getInput(transform));
-        context.setPView(context.getOutput(transform), iter);
+            context.getWindowedValues(context.getInput(transform));
+        PCollectionView<Iterable<T>> output = context.getOutput(transform);
+        Coder<Iterable<WindowedValue<?>>> coderInternal = output.getCoderInternal();
+
+        @SuppressWarnings("unchecked")
+        Iterable<WindowedValue<?>> iterCast =  (Iterable<WindowedValue<?>>) iter;
+
+        context.putPView(output, iterCast, coderInternal);
       }
     };
   }
@@ -569,7 +677,60 @@ public final class TransformTranslator {
                            EvaluationContext context) {
         Iterable<? extends WindowedValue<?>> iter =
             context.getWindowedValues(context.getInput(transform));
-        context.setPView(context.getOutput(transform), iter);
+        PCollectionView<WriteT> output = context.getOutput(transform);
+        Coder<Iterable<WindowedValue<?>>> coderInternal = output.getCoderInternal();
+
+        @SuppressWarnings("unchecked")
+        Iterable<WindowedValue<?>> iterCast =  (Iterable<WindowedValue<?>>) iter;
+
+        context.putPView(output, iterCast, coderInternal);
+      }
+    };
+  }
+
+  private static TransformEvaluator<StorageLevelPTransform> storageLevel() {
+    return new TransformEvaluator<StorageLevelPTransform>() {
+      @Override
+      public void evaluate(StorageLevelPTransform transform, EvaluationContext context) {
+        JavaRDD rdd = ((BoundedDataset) (context).borrowDataset(transform)).getRDD();
+        JavaSparkContext javaSparkContext = context.getSparkContext();
+
+        WindowedValue.ValueOnlyWindowedValueCoder<String> windowCoder =
+            WindowedValue.getValueOnlyCoder(StringUtf8Coder.of());
+        JavaRDD output =
+            javaSparkContext.parallelize(
+                CoderHelpers.toByteArrays(
+                    Collections.singletonList(rdd.getStorageLevel().description()),
+                    StringUtf8Coder.of()))
+            .map(CoderHelpers.fromByteFunction(windowCoder));
+
+        context.putDataset(transform, new BoundedDataset<String>(output));
+      }
+    };
+  }
+
+  private static <K, V, W extends BoundedWindow> TransformEvaluator<Reshuffle<K, V>> reshuffle() {
+    return new TransformEvaluator<Reshuffle<K, V>>() {
+      @Override public void evaluate(Reshuffle<K, V> transform, EvaluationContext context) {
+        @SuppressWarnings("unchecked")
+        JavaRDD<WindowedValue<KV<K, V>>> inRDD =
+            ((BoundedDataset<KV<K, V>>) context.borrowDataset(transform)).getRDD();
+        @SuppressWarnings("unchecked")
+        final WindowingStrategy<?, W> windowingStrategy =
+            (WindowingStrategy<?, W>) context.getInput(transform).getWindowingStrategy();
+        @SuppressWarnings("unchecked")
+        final KvCoder<K, V> coder = (KvCoder<K, V>) context.getInput(transform).getCoder();
+        @SuppressWarnings("unchecked")
+        final WindowFn<Object, W> windowFn = (WindowFn<Object, W>) windowingStrategy.getWindowFn();
+
+        final Coder<K> keyCoder = coder.getKeyCoder();
+        final WindowedValue.WindowedValueCoder<V> wvCoder =
+            WindowedValue.FullWindowedValueCoder.of(coder.getValueCoder(), windowFn.windowCoder());
+
+        JavaRDD<WindowedValue<KV<K, V>>> reshuffled =
+            GroupCombineFunctions.reshuffle(inRDD, keyCoder, wvCoder);
+
+        context.putDataset(transform, new BoundedDataset<>(reshuffled));
       }
     };
   }
@@ -583,17 +744,19 @@ public final class TransformTranslator {
     EVALUATORS.put(HadoopIO.Write.Bound.class, writeHadoop());
     EVALUATORS.put(ParDo.Bound.class, parDo());
     EVALUATORS.put(ParDo.BoundMulti.class, multiDo());
-    EVALUATORS.put(GroupByKeyOnly.class, gbko());
-    EVALUATORS.put(GroupAlsoByWindow.class, gabw());
-    EVALUATORS.put(Combine.GroupedValues.class, grouped());
+    EVALUATORS.put(GroupByKey.class, groupByKey());
+    EVALUATORS.put(Combine.GroupedValues.class, combineGrouped());
     EVALUATORS.put(Combine.Globally.class, combineGlobally());
     EVALUATORS.put(Combine.PerKey.class, combinePerKey());
-    EVALUATORS.put(Flatten.FlattenPCollectionList.class, flattenPColl());
+    EVALUATORS.put(Flatten.PCollections.class, flattenPColl());
     EVALUATORS.put(Create.Values.class, create());
     EVALUATORS.put(View.AsSingleton.class, viewAsSingleton());
     EVALUATORS.put(View.AsIterable.class, viewAsIter());
     EVALUATORS.put(View.CreatePCollectionView.class, createPCollView());
-    EVALUATORS.put(Window.Bound.class, window());
+    EVALUATORS.put(Window.Assign.class, window());
+    EVALUATORS.put(Reshuffle.class, reshuffle());
+    // mostly test evaluators
+    EVALUATORS.put(StorageLevelPTransform.class, storageLevel());
   }
 
   /**

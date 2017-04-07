@@ -36,12 +36,12 @@ import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.options.Validation;
 import org.apache.beam.sdk.transforms.Count;
+import org.apache.beam.sdk.transforms.Distinct;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.Flatten;
 import org.apache.beam.sdk.transforms.Keys;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
-import org.apache.beam.sdk.transforms.RemoveDuplicates;
 import org.apache.beam.sdk.transforms.Values;
 import org.apache.beam.sdk.transforms.View;
 import org.apache.beam.sdk.transforms.WithKeys;
@@ -86,7 +86,7 @@ public class TfIdf {
    *
    * <p>Inherits standard configuration options.
    */
-  private static interface Options extends PipelineOptions {
+  public interface Options extends PipelineOptions {
     @Description("Path to the directory or GCS prefix containing files to read from")
     @Default.String("gs://apache-beam-samples/shakespeare/")
     String getInput();
@@ -159,7 +159,7 @@ public class TfIdf {
     }
 
     @Override
-    public PCollection<KV<URI, String>> apply(PBegin input) {
+    public PCollection<KV<URI, String>> expand(PBegin input) {
       Pipeline pipeline = input.getPipeline();
 
       // Create one TextIO.Read transform for each document
@@ -200,7 +200,7 @@ public class TfIdf {
     public ComputeTfIdf() { }
 
     @Override
-    public PCollection<KV<String, KV<URI, Double>>> apply(
+    public PCollection<KV<String, KV<URI, Double>>> expand(
       PCollection<KV<URI, String>> uriToContent) {
 
       // Compute the total number of documents, and
@@ -209,7 +209,7 @@ public class TfIdf {
       final PCollectionView<Long> totalDocuments =
           uriToContent
           .apply("GetURIs", Keys.<URI>create())
-          .apply("RemoveDuplicateDocs", RemoveDuplicates.<URI>create())
+          .apply("DistinctDocs", Distinct.<URI>create())
           .apply(Count.<URI>globally())
           .apply(View.<Long>asSingleton());
 
@@ -238,7 +238,7 @@ public class TfIdf {
       // Compute a mapping from each word to the total
       // number of documents in which it appears.
       PCollection<KV<String, Long>> wordToDocCount = uriToWords
-          .apply("RemoveDuplicateWords", RemoveDuplicates.<KV<URI, String>>create())
+          .apply("DistinctWords", Distinct.<KV<URI, String>>create())
           .apply(Values.<String>create())
           .apply("CountDocs", Count.<String>perElement());
 
@@ -390,7 +390,7 @@ public class TfIdf {
     }
 
     @Override
-    public PDone apply(PCollection<KV<String, KV<URI, Double>>> wordToUriAndTfIdf) {
+    public PDone expand(PCollection<KV<String, KV<URI, Double>>> wordToUriAndTfIdf) {
       return wordToUriAndTfIdf
           .apply("Format", ParDo.of(new DoFn<KV<String, KV<URI, Double>>, String>() {
             @ProcessElement
@@ -417,6 +417,6 @@ public class TfIdf {
         .apply(new ComputeTfIdf())
         .apply(new WriteTfIdf(options.getOutput()));
 
-    pipeline.run();
+    pipeline.run().waitUntilFinish();
   }
 }

@@ -17,22 +17,26 @@
  */
 package org.apache.beam.sdk.io.kafka;
 
+import com.google.common.base.Joiner;
+
 import java.io.IOException;
 import java.io.Serializable;
 import java.util.List;
+
+import org.apache.beam.sdk.coders.AvroCoder;
 import org.apache.beam.sdk.coders.DefaultCoder;
-import org.apache.beam.sdk.coders.SerializableCoder;
 import org.apache.beam.sdk.io.UnboundedSource;
-import org.apache.kafka.common.TopicPartition;
 
 /**
  * Checkpoint for an unbounded KafkaIO.Read. Consists of Kafka topic name, partition id,
  * and the latest offset consumed so far.
  */
-@DefaultCoder(SerializableCoder.class)
-public class KafkaCheckpointMark implements UnboundedSource.CheckpointMark, Serializable {
+@DefaultCoder(AvroCoder.class)
+public class KafkaCheckpointMark implements UnboundedSource.CheckpointMark {
 
-  private final List<PartitionMark> partitions;
+  private List<PartitionMark> partitions;
+
+  private KafkaCheckpointMark() {} // for Avro
 
   public KafkaCheckpointMark(List<PartitionMark> partitions) {
     this.partitions = partitions;
@@ -50,25 +54,47 @@ public class KafkaCheckpointMark implements UnboundedSource.CheckpointMark, Seri
     // is restarted (checkpoint is not available for job restarts).
   }
 
+  @Override
+  public String toString() {
+    return "KafkaCheckpointMark{partitions=" + Joiner.on(",").join(partitions) + '}';
+  }
+
   /**
    * A tuple to hold topic, partition, and offset that comprise the checkpoint
    * for a single partition.
    */
   public static class PartitionMark implements Serializable {
-    private final TopicPartition topicPartition;
-    private final long offset;
+    private String topic;
+    private int partition;
+    private long nextOffset;
 
-    public PartitionMark(TopicPartition topicPartition, long offset) {
-      this.topicPartition = topicPartition;
-      this.offset = offset;
+    private PartitionMark() {} // for Avro
+
+    public PartitionMark(String topic, int partition, long offset) {
+      this.topic = topic;
+      this.partition = partition;
+      this.nextOffset = offset;
     }
 
-    public TopicPartition getTopicPartition() {
-      return topicPartition;
+    public String getTopic() {
+      return topic;
     }
 
-    public long getOffset() {
-      return offset;
+    public int getPartition() {
+      return partition;
+    }
+
+    public long getNextOffset() {
+      return nextOffset;
+    }
+
+    @Override
+    public String toString() {
+      return "PartitionMark{"
+          + "topic='" + topic + '\''
+          + ", partition=" + partition
+          + ", nextOffset=" + nextOffset
+          + '}';
     }
   }
 }

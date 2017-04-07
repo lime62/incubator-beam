@@ -18,14 +18,14 @@
 package org.apache.beam.runners.core;
 
 import java.util.List;
-
-import org.apache.beam.runners.core.DoFnRunner.ReduceFnExecutor;
+import org.apache.beam.runners.core.ExecutionContext.StepContext;
+import org.apache.beam.runners.core.StatefulDoFnRunner.CleanupTimer;
+import org.apache.beam.runners.core.StatefulDoFnRunner.StateCleaner;
 import org.apache.beam.sdk.options.PipelineOptions;
-import org.apache.beam.sdk.transforms.Aggregator.AggregatorFactory;
-import org.apache.beam.sdk.transforms.OldDoFn;
+import org.apache.beam.sdk.transforms.Aggregator;
+import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.Sum;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
-import org.apache.beam.sdk.util.ExecutionContext.StepContext;
-import org.apache.beam.sdk.util.KeyedWorkItem;
 import org.apache.beam.sdk.util.SideInputReader;
 import org.apache.beam.sdk.util.WindowedValue;
 import org.apache.beam.sdk.util.WindowingStrategy;
@@ -43,17 +43,19 @@ public class DoFnRunners {
     /**
      * Outputs a single element to the receiver indicated by the given {@link TupleTag}.
      */
-    public <T> void output(TupleTag<T> tag, WindowedValue<T> output);
+    <T> void output(TupleTag<T> tag, WindowedValue<T> output);
   }
 
   /**
-   * Returns a basic implementation of {@link DoFnRunner} that works for most {@link OldDoFn DoFns}.
+   * Returns an implementation of {@link DoFnRunner} that for a {@link DoFn}.
    *
-   * <p>It invokes {@link OldDoFn#processElement} for each input.
+   * <p>If the {@link DoFn} observes the window, this runner will explode the windows of a
+   * compressed {@link WindowedValue}. It is the responsibility of the runner to perform any key
+   * partitioning needed, etc.
    */
   public static <InputT, OutputT> DoFnRunner<InputT, OutputT> simpleRunner(
       PipelineOptions options,
-      OldDoFn<InputT, OutputT> fn,
+      DoFn<InputT, OutputT> fn,
       SideInputReader sideInputReader,
       OutputManager outputManager,
       TupleTag<OutputT> mainOutputTag,
@@ -74,43 +76,13 @@ public class DoFnRunners {
   }
 
   /**
-   * Returns an implementation of {@link DoFnRunner} that handles late data dropping.
+   * Returns a basic implementation of {@link DoFnRunner} that works for most {@link OldDoFn DoFns}.
    *
-   * <p>It drops elements from expired windows before they reach the underlying {@link OldDoFn}.
+   * <p>It invokes {@link OldDoFn#processElement} for each input.
    */
-  public static <K, InputT, OutputT, W extends BoundedWindow>
-      DoFnRunner<KeyedWorkItem<K, InputT>, KV<K, OutputT>> lateDataDroppingRunner(
-          PipelineOptions options,
-          ReduceFnExecutor<K, InputT, OutputT, W> reduceFnExecutor,
-          SideInputReader sideInputReader,
-          OutputManager outputManager,
-          TupleTag<KV<K, OutputT>> mainOutputTag,
-          List<TupleTag<?>> sideOutputTags,
-          StepContext stepContext,
-          AggregatorFactory aggregatorFactory,
-          WindowingStrategy<?, W> windowingStrategy) {
-    DoFnRunner<KeyedWorkItem<K, InputT>, KV<K, OutputT>> simpleDoFnRunner =
-        simpleRunner(
-            options,
-            reduceFnExecutor.asDoFn(),
-            sideInputReader,
-            outputManager,
-            mainOutputTag,
-            sideOutputTags,
-            stepContext,
-            aggregatorFactory,
-            windowingStrategy);
-    return new LateDataDroppingDoFnRunner<>(
-        simpleDoFnRunner,
-        windowingStrategy,
-        stepContext.timerInternals(),
-        reduceFnExecutor.getDroppedDueToLatenessAggregator());
-  }
-
-
-  public static <InputT, OutputT> DoFnRunner<InputT, OutputT> createDefault(
+  public static <InputT, OutputT> DoFnRunner<InputT, OutputT> simpleRunner(
       PipelineOptions options,
-      OldDoFn<InputT, OutputT> doFn,
+      OldDoFn<InputT, OutputT> fn,
       SideInputReader sideInputReader,
       OutputManager outputManager,
       TupleTag<OutputT> mainOutputTag,
@@ -118,25 +90,9 @@ public class DoFnRunners {
       StepContext stepContext,
       AggregatorFactory aggregatorFactory,
       WindowingStrategy<?, ?> windowingStrategy) {
-    if (doFn instanceof ReduceFnExecutor) {
-      @SuppressWarnings("rawtypes")
-      ReduceFnExecutor fn = (ReduceFnExecutor) doFn;
-      @SuppressWarnings({"unchecked", "cast", "rawtypes"})
-      DoFnRunner<InputT, OutputT> runner = (DoFnRunner<InputT, OutputT>) lateDataDroppingRunner(
-          options,
-          fn,
-          sideInputReader,
-          outputManager,
-          (TupleTag) mainOutputTag,
-          sideOutputTags,
-          stepContext,
-          aggregatorFactory,
-          (WindowingStrategy) windowingStrategy);
-      return runner;
-    }
-    return simpleRunner(
+    return new SimpleOldDoFnRunner<>(
         options,
-        doFn,
+        fn,
         sideInputReader,
         outputManager,
         mainOutputTag,
@@ -144,5 +100,50 @@ public class DoFnRunners {
         stepContext,
         aggregatorFactory,
         windowingStrategy);
+  }
+
+  /**
+   * Returns an implementation of {@link DoFnRunner} that handles late data dropping.
+   *
+   * <p>It drops elements from expired windows before they reach the underlying {@link OldDoFn}.
+   */
+  public static <K, InputT, OutputT, W extends BoundedWindow>
+      DoFnRunner<KeyedWorkItem<K, InputT>, KV<K, OutputT>> lateDataDroppingRunner(
+          DoFnRunner<KeyedWorkItem<K, InputT>, KV<K, OutputT>> wrappedRunner,
+          StepContext stepContext,
+          WindowingStrategy<?, W> windowingStrategy,
+          Aggregator<Long, Long> droppedDueToLatenessAggregator) {
+    return new LateDataDroppingDoFnRunner<>(
+        wrappedRunner,
+        windowingStrategy,
+        stepContext.timerInternals(),
+        droppedDueToLatenessAggregator);
+  }
+
+  /**
+   * Returns an implementation of {@link DoFnRunner} that handles
+   * late data dropping and garbage collection for stateful {@link DoFn DoFns}.
+   *
+   * <p>It registers a timer by TimeInternals, and clean all states by StateInternals.
+   */
+  public static <InputT, OutputT, W extends BoundedWindow>
+      DoFnRunner<InputT, OutputT> defaultStatefulDoFnRunner(
+          DoFn<InputT, OutputT> fn,
+          DoFnRunner<InputT, OutputT> doFnRunner,
+          StepContext stepContext,
+          AggregatorFactory aggregatorFactory,
+          WindowingStrategy<?, ?> windowingStrategy,
+          CleanupTimer cleanupTimer,
+          StateCleaner<W> stateCleaner) {
+    Aggregator<Long, Long> droppedDueToLateness = aggregatorFactory.createAggregatorForDoFn(
+        fn.getClass(), stepContext, StatefulDoFnRunner.DROPPED_DUE_TO_LATENESS_COUNTER,
+        Sum.ofLongs());
+
+    return new StatefulDoFnRunner<>(
+        doFnRunner,
+        windowingStrategy,
+        cleanupTimer,
+        stateCleaner,
+        droppedDueToLateness);
   }
 }

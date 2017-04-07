@@ -75,7 +75,7 @@ public class GcsPathValidator implements PathValidator {
   private void verifyPathIsAccessible(String path, String errorMessage) {
     GcsPath gcsPath = getGcsPath(path);
     try {
-      checkArgument(gcpOptions.getGcsUtil().bucketExists(gcsPath),
+      checkArgument(gcpOptions.getGcsUtil().bucketAccessible(gcsPath),
         errorMessage, path);
     } catch (IOException e) {
       throw new RuntimeException(
@@ -89,8 +89,7 @@ public class GcsPathValidator implements PathValidator {
       return GcsPath.fromUri(path);
     } catch (IllegalArgumentException e) {
       throw new IllegalArgumentException(String.format(
-          "%s expected a valid 'gs://' path but was given '%s'",
-          gcpOptions.getRunner().getSimpleName(), path), e);
+          "Expected a valid 'gs://' path but was given '%s'", path), e);
     }
   }
 }

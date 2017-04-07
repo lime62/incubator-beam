@@ -17,12 +17,15 @@
  */
 package org.apache.beam.sdk.io.kafka;
 
+import static org.apache.beam.sdk.transforms.display.DisplayDataMatchers.hasDisplayItem;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Lists;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -35,11 +38,12 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import javax.annotation.Nullable;
-import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.Pipeline.PipelineExecutionException;
 import org.apache.beam.sdk.coders.BigEndianIntegerCoder;
 import org.apache.beam.sdk.coders.BigEndianLongCoder;
+import org.apache.beam.sdk.coders.ByteArrayCoder;
 import org.apache.beam.sdk.io.Read;
 import org.apache.beam.sdk.io.UnboundedSource;
 import org.apache.beam.sdk.io.UnboundedSource.UnboundedReader;
@@ -48,14 +52,15 @@ import org.apache.beam.sdk.testing.NeedsRunner;
 import org.apache.beam.sdk.testing.PAssert;
 import org.apache.beam.sdk.testing.TestPipeline;
 import org.apache.beam.sdk.transforms.Count;
+import org.apache.beam.sdk.transforms.Distinct;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.Flatten;
 import org.apache.beam.sdk.transforms.Max;
 import org.apache.beam.sdk.transforms.Min;
 import org.apache.beam.sdk.transforms.ParDo;
-import org.apache.beam.sdk.transforms.RemoveDuplicates;
 import org.apache.beam.sdk.transforms.SerializableFunction;
 import org.apache.beam.sdk.transforms.Values;
+import org.apache.beam.sdk.transforms.display.DisplayData;
 import org.apache.beam.sdk.util.CoderUtils;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
@@ -69,6 +74,7 @@ import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
+import org.hamcrest.collection.IsIterableContainingInAnyOrder;
 import org.joda.time.Instant;
 import org.junit.Rule;
 import org.junit.Test;
@@ -78,7 +84,9 @@ import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 
 /**
- * Tests of {@link KafkaSource}.
+ * Tests of {@link KafkaIO}.
+ * Run with 'mvn test -Dkafka.clients.version=0.10.1.1',
+ * or 'mvn test -Dkafka.clients.version=0.9.0.1' for either Kafka client version
  */
 @RunWith(JUnit4.class)
 public class KafkaIOTest {
@@ -91,12 +99,16 @@ public class KafkaIOTest {
    */
 
   @Rule
+  public final transient TestPipeline p = TestPipeline.create();
+
+  @Rule
   public ExpectedException thrown = ExpectedException.none();
 
   // Update mock consumer with records distributed among the given topics, each with given number
   // of partitions. Records are assigned in round-robin order among the partitions.
   private static MockConsumer<byte[], byte[]> mkMockConsumer(
-      List<String> topics, int partitionsPerTopic, int numElements) {
+      List<String> topics, int partitionsPerTopic, int numElements,
+      OffsetResetStrategy offsetResetStrategy) {
 
     final List<TopicPartition> partitions = new ArrayList<>();
     final Map<TopicPartition, List<ConsumerRecord<byte[], byte[]>>> records = new HashMap<>();
@@ -105,8 +117,10 @@ public class KafkaIOTest {
     for (String topic : topics) {
       List<PartitionInfo> partIds = new ArrayList<>(partitionsPerTopic);
       for (int i = 0; i < partitionsPerTopic; i++) {
-        partitions.add(new TopicPartition(topic, i));
+        TopicPartition tp = new TopicPartition(topic, i);
+        partitions.add(tp);
         partIds.add(new PartitionInfo(topic, i, null, null, null));
+        records.put(tp, new ArrayList<ConsumerRecord<byte[], byte[]>>());
       }
       partitionMap.put(topic, partIds);
     }
@@ -118,30 +132,32 @@ public class KafkaIOTest {
       int pIdx = i % numPartitions;
       TopicPartition tp = partitions.get(pIdx);
 
-      if (!records.containsKey(tp)) {
-        records.put(tp, new ArrayList<ConsumerRecord<byte[], byte[]>>());
-      }
       records.get(tp).add(
-          new ConsumerRecord<byte[], byte[]>(
+          new ConsumerRecord<>(
               tp.topic(),
               tp.partition(),
               offsets[pIdx]++,
-              ByteBuffer.wrap(new byte[8]).putInt(i).array(),    // key is 4 byte record id
+              ByteBuffer.wrap(new byte[4]).putInt(i).array(),    // key is 4 byte record id
               ByteBuffer.wrap(new byte[8]).putLong(i).array())); // value is 8 byte record id
     }
 
-    MockConsumer<byte[], byte[]> consumer =
-        new MockConsumer<byte[], byte[]>(OffsetResetStrategy.EARLIEST) {
-          // override assign() to add records that belong to the assigned partitions.
-          public void assign(List<TopicPartition> assigned) {
+    // This is updated when reader assigns partitions.
+    final AtomicReference<List<TopicPartition>> assignedPartitions =
+        new AtomicReference<>(Collections.<TopicPartition>emptyList());
+
+    final MockConsumer<byte[], byte[]> consumer =
+        new MockConsumer<byte[], byte[]>(offsetResetStrategy) {
+          // override assign() in order to set offset limits & to save assigned partitions.
+          //remove keyword '@Override' here, it can work with Kafka client 0.9 and 0.10 as:
+          //1. SpEL can find this function, either input is List or Collection;
+          //2. List extends Collection, so super.assign() could find either assign(List)
+          //  or assign(Collection).
+          public void assign(final List<TopicPartition> assigned) {
             super.assign(assigned);
+            assignedPartitions.set(ImmutableList.copyOf(assigned));
             for (TopicPartition tp : assigned) {
-              for (ConsumerRecord<byte[], byte[]> r : records.get(tp)) {
-                addRecord(r);
-              }
               updateBeginningOffsets(ImmutableMap.of(tp, 0L));
               updateEndOffsets(ImmutableMap.of(tp, (long) records.get(tp).size()));
-              seek(tp, 0);
             }
           }
         };
@@ -150,6 +166,29 @@ public class KafkaIOTest {
       consumer.updatePartitions(topic, partitionMap.get(topic));
     }
 
+    // MockConsumer does not maintain any relationship between partition seek position and the
+    // records added. e.g. if we add 10 records to a partition and then seek to end of the
+    // partition, MockConsumer is still going to return the 10 records in next poll. It is
+    // our responsibility to make sure currently enqueued records sync with partition offsets.
+    // The following task will be called inside each invocation to MockConsumer.poll().
+    // We enqueue only the records with the offset >= partition's current position.
+    Runnable recordEnquerTask = new Runnable() {
+      @Override
+      public void run() {
+        // add all the records with offset >= current partition position.
+        for (TopicPartition tp : assignedPartitions.get()) {
+          long curPos = consumer.position(tp);
+          for (ConsumerRecord<byte[], byte[]> r : records.get(tp)) {
+            if (r.offset() >= curPos) {
+              consumer.addRecord(r);
+            }
+          }
+        }
+        consumer.schedulePollTask(this);
+      }
+    };
+
+    consumer.schedulePollTask(recordEnquerTask);
     return consumer;
   }
 
@@ -158,15 +197,21 @@ public class KafkaIOTest {
     private final List<String> topics;
     private final int partitionsPerTopic;
     private final int numElements;
+    private final OffsetResetStrategy offsetResetStrategy;
 
-    public ConsumerFactoryFn(List<String> topics, int partitionsPerTopic, int numElements) {
+    public ConsumerFactoryFn(List<String> topics,
+                             int partitionsPerTopic,
+                             int numElements,
+                             OffsetResetStrategy offsetResetStrategy) {
       this.topics = topics;
       this.partitionsPerTopic = partitionsPerTopic;
       this.numElements = numElements;
+      this.offsetResetStrategy = offsetResetStrategy;
     }
 
+    @Override
     public Consumer<byte[], byte[]> apply(Map<String, Object> config) {
-      return mkMockConsumer(topics, partitionsPerTopic, numElements);
+      return mkMockConsumer(topics, partitionsPerTopic, numElements, offsetResetStrategy);
     }
   }
 
@@ -174,16 +219,17 @@ public class KafkaIOTest {
    * Creates a consumer with two topics, with 5 partitions each.
    * numElements are (round-robin) assigned all the 10 partitions.
    */
-  private static KafkaIO.TypedRead<Integer, Long> mkKafkaReadTransform(
+  private static KafkaIO.Read<Integer, Long> mkKafkaReadTransform(
       int numElements,
       @Nullable SerializableFunction<KV<Integer, Long>, Instant> timestampFn) {
 
     List<String> topics = ImmutableList.of("topic_a", "topic_b");
 
-    KafkaIO.Read<Integer, Long> reader = KafkaIO.read()
-        .withBootstrapServers("none")
+    KafkaIO.Read<Integer, Long> reader = KafkaIO.<Integer, Long>read()
+        .withBootstrapServers("myServer1:9092,myServer2:9092")
         .withTopics(topics)
-        .withConsumerFactoryFn(new ConsumerFactoryFn(topics, 10, numElements)) // 20 partitions
+        .withConsumerFactoryFn(new ConsumerFactoryFn(
+            topics, 10, numElements, OffsetResetStrategy.EARLIEST)) // 20 partitions
         .withKeyCoder(BigEndianIntegerCoder.of())
         .withValueCoder(BigEndianLongCoder.of())
         .withMaxNumRecords(numElements);
@@ -218,7 +264,7 @@ public class KafkaIOTest {
       .isEqualTo(numElements);
     // Unique count == numElements
     PAssert
-      .thatSingleton(input.apply(RemoveDuplicates.<Long>create())
+      .thatSingleton(input.apply(Distinct.<Long>create())
                           .apply("UniqueCount", Count.<Long>globally()))
       .isEqualTo(numElements);
     // Min == 0
@@ -234,7 +280,6 @@ public class KafkaIOTest {
   @Test
   @Category(NeedsRunner.class)
   public void testUnboundedSource() {
-    Pipeline p = TestPipeline.create();
     int numElements = 1000;
 
     PCollection<Long> input = p
@@ -249,15 +294,16 @@ public class KafkaIOTest {
   @Test
   @Category(NeedsRunner.class)
   public void testUnboundedSourceWithExplicitPartitions() {
-    Pipeline p = TestPipeline.create();
     int numElements = 1000;
 
     List<String> topics = ImmutableList.of("test");
 
-    KafkaIO.TypedRead<byte[], Long> reader = KafkaIO.read()
+    KafkaIO.Read<byte[], Long> reader = KafkaIO.<byte[], Long>read()
         .withBootstrapServers("none")
         .withTopicPartitions(ImmutableList.of(new TopicPartition("test", 5)))
-        .withConsumerFactoryFn(new ConsumerFactoryFn(topics, 10, numElements)) // 10 partitions
+        .withConsumerFactoryFn(new ConsumerFactoryFn(
+            topics, 10, numElements, OffsetResetStrategy.EARLIEST)) // 10 partitions
+        .withKeyCoder(ByteArrayCoder.of())
         .withValueCoder(BigEndianLongCoder.of())
         .withMaxNumRecords(numElements / 10);
 
@@ -287,7 +333,7 @@ public class KafkaIOTest {
   @Test
   @Category(NeedsRunner.class)
   public void testUnboundedSourceTimestamps() {
-    Pipeline p = TestPipeline.create();
+
     int numElements = 1000;
 
     PCollection<Long> input = p
@@ -298,7 +344,7 @@ public class KafkaIOTest {
 
     PCollection<Long> diffs = input
         .apply("TimestampDiff", ParDo.of(new ElementValueDiff()))
-        .apply("RemoveDuplicateTimestamps", RemoveDuplicates.<Long>create());
+        .apply("DistinctTimestamps", Distinct.<Long>create());
     // This assert also confirms that diffs only has one unique value.
     PAssert.thatSingleton(diffs).isEqualTo(0L);
 
@@ -315,7 +361,7 @@ public class KafkaIOTest {
   @Test
   @Category(NeedsRunner.class)
   public void testUnboundedSourceSplits() throws Exception {
-    Pipeline p = TestPipeline.create();
+
     int numElements = 1000;
     int numSplits = 10;
 
@@ -354,10 +400,20 @@ public class KafkaIOTest {
   // Kafka records are read in a separate thread inside the reader. As a result advance() might not
   // read any records even from the mock consumer, especially for the first record.
   // This is a helper method to loop until we read a record.
-  private static void advanceOnce(UnboundedReader<?> reader) throws IOException {
+  private static void advanceOnce(UnboundedReader<?> reader, boolean isStarted) throws IOException {
+    if (!isStarted && reader.start()) {
+      return;
+    }
     while (!reader.advance()) {
       // very rarely will there be more than one attempts.
-      // in case of a bug we might end up looping forever, and test will fail with a timeout.
+      // In case of a bug we might end up looping forever, and test will fail with a timeout.
+
+      // Avoid hard cpu spinning in case of a test failure.
+      try {
+        Thread.sleep(1);
+      } catch (InterruptedException e) {
+        throw new RuntimeException(e);
+      }
     }
   }
 
@@ -369,19 +425,15 @@ public class KafkaIOTest {
     UnboundedSource<KafkaRecord<Integer, Long>, KafkaCheckpointMark> source =
         mkKafkaReadTransform(numElements, new ValueAsTimestampFn())
           .makeSource()
-          .generateInitialSplits(1, PipelineOptionsFactory.fromArgs(new String[0]).create())
+          .generateInitialSplits(1, PipelineOptionsFactory.create())
           .get(0);
 
     UnboundedReader<KafkaRecord<Integer, Long>> reader = source.createReader(null, null);
-    final int numToSkip = 3;
+    final int numToSkip = 20; // one from each partition.
 
     // advance numToSkip elements
-    if (!reader.start()) {
-      advanceOnce(reader);
-    }
-
-    for (long l = 0; l < numToSkip - 1; ++l) {
-      advanceOnce(reader);
+    for (int i = 0; i < numToSkip; ++i) {
+      advanceOnce(reader, i > 0);
     }
 
     // Confirm that we get the expected element in sequence before checkpointing.
@@ -396,17 +448,68 @@ public class KafkaIOTest {
     // Confirm that we get the next elements in sequence.
     // This also confirms that Reader interleaves records from each partitions by the reader.
 
-    if (!reader.start()) {
-      advanceOnce(reader);
-    }
-
     for (int i = numToSkip; i < numElements; i++) {
+      advanceOnce(reader, i > numToSkip);
       assertEquals(i, (long) reader.getCurrent().getKV().getValue());
       assertEquals(i, reader.getCurrentTimestamp().getMillis());
-      if ((i + 1) < numElements) {
-        advanceOnce(reader);
-      }
     }
+  }
+
+  @Test
+  public void testUnboundedSourceCheckpointMarkWithEmptyPartitions() throws Exception {
+    // Similar to testUnboundedSourceCheckpointMark(), but verifies that source resumes
+    // properly from empty partitions, without missing messages added since checkpoint.
+
+    // Initialize consumer with fewer elements than number of partitions so that some are empty.
+    int initialNumElements = 5;
+    UnboundedSource<KafkaRecord<Integer, Long>, KafkaCheckpointMark> source =
+        mkKafkaReadTransform(initialNumElements, new ValueAsTimestampFn())
+            .makeSource()
+            .generateInitialSplits(1, PipelineOptionsFactory.create())
+            .get(0);
+
+    UnboundedReader<KafkaRecord<Integer, Long>> reader = source.createReader(null, null);
+
+    for (int l = 0; l < initialNumElements; ++l) {
+      advanceOnce(reader, l > 0);
+    }
+
+    // Checkpoint and restart, and confirm that the source continues correctly.
+    KafkaCheckpointMark mark = CoderUtils.clone(
+        source.getCheckpointMarkCoder(), (KafkaCheckpointMark) reader.getCheckpointMark());
+
+    // Create another source with MockConsumer with OffsetResetStrategy.LATEST. This insures that
+    // the reader need to explicitly need to seek to first offset for partitions that were empty.
+
+    int numElements = 100; // all the 20 partitions will have elements
+    List<String> topics = ImmutableList.of("topic_a", "topic_b");
+
+    source = KafkaIO.<Integer, Long>read()
+        .withBootstrapServers("none")
+        .withTopics(topics)
+        .withConsumerFactoryFn(new ConsumerFactoryFn(
+            topics, 10, numElements, OffsetResetStrategy.LATEST))
+        .withKeyCoder(BigEndianIntegerCoder.of())
+        .withValueCoder(BigEndianLongCoder.of())
+        .withMaxNumRecords(numElements)
+        .withTimestampFn(new ValueAsTimestampFn())
+        .makeSource()
+        .generateInitialSplits(1, PipelineOptionsFactory.create())
+        .get(0);
+
+    reader = source.createReader(null, mark);
+
+    // Verify in any order. As the partitions are unevenly read, the returned records are not in a
+    // simple order. Note that testUnboundedSourceCheckpointMark() verifies round-robin oder.
+
+    List<Long> expected = new ArrayList<>();
+    List<Long> actual = new ArrayList<>();
+    for (long i = initialNumElements; i < numElements; i++) {
+      advanceOnce(reader, i > initialNumElements);
+      expected.add(i);
+      actual.add(reader.getCurrent().getKV().getValue());
+    }
+    assertThat(actual, IsIterableContainingInAnyOrder.containsInAnyOrder(expected.toArray()));
   }
 
   @Test
@@ -422,25 +525,24 @@ public class KafkaIOTest {
 
       ProducerSendCompletionThread completionThread = new ProducerSendCompletionThread().start();
 
-      Pipeline pipeline = TestPipeline.create();
       String topic = "test";
 
-      pipeline
+      p
         .apply(mkKafkaReadTransform(numElements, new ValueAsTimestampFn())
             .withoutMetadata())
-        .apply(KafkaIO.write()
+        .apply(KafkaIO.<Integer, Long>write()
             .withBootstrapServers("none")
             .withTopic(topic)
             .withKeyCoder(BigEndianIntegerCoder.of())
             .withValueCoder(BigEndianLongCoder.of())
             .withProducerFactoryFn(new ProducerFactoryFn()));
 
-      pipeline.run();
+      p.run();
 
       completionThread.shutdown();
 
       verifyProducerRecords(topic, numElements, false);
-     }
+    }
   }
 
   @Test
@@ -455,22 +557,20 @@ public class KafkaIOTest {
 
       ProducerSendCompletionThread completionThread = new ProducerSendCompletionThread().start();
 
-      Pipeline pipeline = TestPipeline.create();
       String topic = "test";
 
-      pipeline
+      p
         .apply(mkKafkaReadTransform(numElements, new ValueAsTimestampFn())
             .withoutMetadata())
         .apply(Values.<Long>create()) // there are no keys
-        .apply(KafkaIO.write()
+        .apply(KafkaIO.<Integer, Long>write()
             .withBootstrapServers("none")
             .withTopic(topic)
-            .withKeyCoder(BigEndianIntegerCoder.of())
             .withValueCoder(BigEndianLongCoder.of())
             .withProducerFactoryFn(new ProducerFactoryFn())
             .values());
 
-      pipeline.run();
+      p.run();
 
       completionThread.shutdown();
 
@@ -496,16 +596,15 @@ public class KafkaIOTest {
 
       MOCK_PRODUCER.clear();
 
-      Pipeline pipeline = TestPipeline.create();
       String topic = "test";
 
       ProducerSendCompletionThread completionThreadWithErrors =
           new ProducerSendCompletionThread(10, 100).start();
 
-      pipeline
+      p
         .apply(mkKafkaReadTransform(numElements, new ValueAsTimestampFn())
             .withoutMetadata())
-        .apply(KafkaIO.write()
+        .apply(KafkaIO.<Integer, Long>write()
             .withBootstrapServers("none")
             .withTopic(topic)
             .withKeyCoder(BigEndianIntegerCoder.of())
@@ -513,7 +612,7 @@ public class KafkaIOTest {
             .withProducerFactoryFn(new ProducerFactoryFn()));
 
       try {
-        pipeline.run();
+        p.run();
       } catch (PipelineExecutionException e) {
         // throwing inner exception helps assert that first exception is thrown from the Sink
         throw e.getCause().getCause();
@@ -521,6 +620,54 @@ public class KafkaIOTest {
         completionThreadWithErrors.shutdown();
       }
     }
+  }
+
+  @Test
+  public void testSourceDisplayData() {
+    KafkaIO.Read<Integer, Long> read = mkKafkaReadTransform(10, null);
+
+    DisplayData displayData = DisplayData.from(read);
+
+    assertThat(displayData, hasDisplayItem("topics", "topic_a,topic_b"));
+    assertThat(displayData, hasDisplayItem("enable.auto.commit", false));
+    assertThat(displayData, hasDisplayItem("bootstrap.servers", "myServer1:9092,myServer2:9092"));
+    assertThat(displayData, hasDisplayItem("auto.offset.reset", "latest"));
+    assertThat(displayData, hasDisplayItem("receive.buffer.bytes", 524288));
+  }
+
+  @Test
+  public void testSourceWithExplicitPartitionsDisplayData() {
+    KafkaIO.Read<byte[], Long> read = KafkaIO.<byte[], Long>read()
+        .withBootstrapServers("myServer1:9092,myServer2:9092")
+        .withTopicPartitions(ImmutableList.of(new TopicPartition("test", 5),
+            new TopicPartition("test", 6)))
+        .withConsumerFactoryFn(new ConsumerFactoryFn(
+            Lists.newArrayList("test"), 10, 10, OffsetResetStrategy.EARLIEST)) // 10 partitions
+        .withKeyCoder(ByteArrayCoder.of())
+        .withValueCoder(BigEndianLongCoder.of());
+
+    DisplayData displayData = DisplayData.from(read);
+
+    assertThat(displayData, hasDisplayItem("topicPartitions", "test-5,test-6"));
+    assertThat(displayData, hasDisplayItem("enable.auto.commit", false));
+    assertThat(displayData, hasDisplayItem("bootstrap.servers", "myServer1:9092,myServer2:9092"));
+    assertThat(displayData, hasDisplayItem("auto.offset.reset", "latest"));
+    assertThat(displayData, hasDisplayItem("receive.buffer.bytes", 524288));
+  }
+
+  @Test
+  public void testSinkDisplayData() {
+    KafkaIO.Write<Integer, Long> write = KafkaIO.<Integer, Long>write()
+        .withBootstrapServers("myServerA:9092,myServerB:9092")
+        .withTopic("myTopic")
+        .withValueCoder(BigEndianLongCoder.of())
+        .withProducerFactoryFn(new ProducerFactoryFn());
+
+    DisplayData displayData = DisplayData.from(write);
+
+    assertThat(displayData, hasDisplayItem("topic", "myTopic"));
+    assertThat(displayData, hasDisplayItem("bootstrap.servers", "myServerA:9092,myServerB:9092"));
+    assertThat(displayData, hasDisplayItem("retries", 3));
   }
 
   private static void verifyProducerRecords(String topic, int numElements, boolean keyIsAbsent) {

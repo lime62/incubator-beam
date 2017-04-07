@@ -17,6 +17,7 @@
  */
 package org.apache.beam.runners.direct;
 
+import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.base.Preconditions.checkState;
 
 import com.google.common.collect.ImmutableMap;
@@ -24,14 +25,14 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
-import javax.annotation.Nullable;
+import org.apache.beam.runners.core.SplittableParDo;
 import org.apache.beam.runners.direct.DirectGroupByKey.DirectGroupAlsoByWindow;
 import org.apache.beam.runners.direct.DirectGroupByKey.DirectGroupByKeyOnly;
 import org.apache.beam.runners.direct.DirectRunner.CommittedBundle;
+import org.apache.beam.runners.direct.ParDoMultiOverrideFactory.StatefulParDo;
 import org.apache.beam.sdk.io.Read;
-import org.apache.beam.sdk.testing.TestStream;
 import org.apache.beam.sdk.transforms.AppliedPTransform;
-import org.apache.beam.sdk.transforms.Flatten.FlattenPCollectionList;
+import org.apache.beam.sdk.transforms.Flatten.PCollections;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.transforms.windowing.Window;
@@ -45,20 +46,26 @@ import org.slf4j.LoggerFactory;
 class TransformEvaluatorRegistry implements TransformEvaluatorFactory {
   private static final Logger LOG = LoggerFactory.getLogger(TransformEvaluatorRegistry.class);
   public static TransformEvaluatorRegistry defaultRegistry(EvaluationContext ctxt) {
-    @SuppressWarnings("rawtypes")
+    @SuppressWarnings({"rawtypes"})
     ImmutableMap<Class<? extends PTransform>, TransformEvaluatorFactory> primitives =
         ImmutableMap.<Class<? extends PTransform>, TransformEvaluatorFactory>builder()
             .put(Read.Bounded.class, new BoundedReadEvaluatorFactory(ctxt))
             .put(Read.Unbounded.class, new UnboundedReadEvaluatorFactory(ctxt))
-            .put(ParDo.Bound.class, new ParDoSingleEvaluatorFactory(ctxt))
-            .put(ParDo.BoundMulti.class, new ParDoMultiEvaluatorFactory(ctxt))
-            .put(FlattenPCollectionList.class, new FlattenEvaluatorFactory(ctxt))
+            .put(ParDo.BoundMulti.class, new ParDoEvaluatorFactory<>(ctxt))
+            .put(StatefulParDo.class, new StatefulParDoEvaluatorFactory<>(ctxt))
+            .put(PCollections.class, new FlattenEvaluatorFactory(ctxt))
             .put(ViewEvaluatorFactory.WriteView.class, new ViewEvaluatorFactory(ctxt))
-            .put(Window.Bound.class, new WindowEvaluatorFactory(ctxt))
+            .put(Window.Assign.class, new WindowEvaluatorFactory(ctxt))
             // Runner-specific primitives used in expansion of GroupByKey
             .put(DirectGroupByKeyOnly.class, new GroupByKeyOnlyEvaluatorFactory(ctxt))
             .put(DirectGroupAlsoByWindow.class, new GroupAlsoByWindowEvaluatorFactory(ctxt))
-            .put(TestStream.class, new TestStreamEvaluatorFactory(ctxt))
+            .put(
+                TestStreamEvaluatorFactory.DirectTestStreamFactory.DirectTestStream.class,
+                new TestStreamEvaluatorFactory(ctxt))
+            // Runner-specific primitive used in expansion of SplittableParDo
+            .put(
+                SplittableParDo.ProcessElements.class,
+                new SplittableProcessElementsEvaluatorFactory<>(ctxt))
             .build();
     return new TransformEvaluatorRegistry(primitives);
   }
@@ -78,11 +85,14 @@ class TransformEvaluatorRegistry implements TransformEvaluatorFactory {
 
   @Override
   public <InputT> TransformEvaluator<InputT> forApplication(
-      AppliedPTransform<?, ?, ?> application, @Nullable CommittedBundle<?> inputBundle)
+      AppliedPTransform<?, ?, ?> application, CommittedBundle<?> inputBundle)
       throws Exception {
     checkState(
         !finished.get(), "Tried to get an evaluator for a finished TransformEvaluatorRegistry");
-    TransformEvaluatorFactory factory = factories.get(application.getTransform().getClass());
+    Class<? extends PTransform> transformClass = application.getTransform().getClass();
+    TransformEvaluatorFactory factory =
+        checkNotNull(
+            factories.get(transformClass), "No evaluator for PTransform type %s", transformClass);
     return factory.forApplication(application, inputBundle);
   }
 

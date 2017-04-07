@@ -48,15 +48,15 @@ import org.slf4j.LoggerFactory;
  * BigQuery; using standalone DoFns; use of the sum by key transform; examples of
  * Java 8 lambda syntax.
  *
- * <p> In this gaming scenario, many users play, as members of different teams, over the course of a
+ * <p>In this gaming scenario, many users play, as members of different teams, over the course of a
  * day, and their actions are logged for processing.  Some of the logged game events may be late-
  * arriving, if users play on mobile devices and go transiently offline for a period.
  *
- * <p> This pipeline does batch processing of data collected from gaming events. It calculates the
+ * <p>This pipeline does batch processing of data collected from gaming events. It calculates the
  * sum of scores per user, over an entire batch of gaming data (collected, say, for each day). The
  * batch processing will not include any late data that arrives after the day's cutoff point.
  *
- * <p> To execute this pipeline using the Dataflow service and static example input data, specify
+ * <p>To execute this pipeline using the Dataflow service and static example input data, specify
  * the pipeline configuration like this:
  * <pre>{@code
  *   --project=YOUR_PROJECT_ID
@@ -67,8 +67,8 @@ import org.slf4j.LoggerFactory;
  * </pre>
  * where the BigQuery dataset you specify must already exist.
  *
- * <p> Optionally include the --input argument to specify a batch input file.
- * See the --input default value for example batch data file, or use {@link injector.Injector} to
+ * <p>Optionally include the --input argument to specify a batch input file.
+ * See the --input default value for example batch data file, or use {@code injector.Injector} to
  * generate your own batch data.
   */
 public class UserScore {
@@ -126,7 +126,7 @@ public class UserScore {
     // Log and count parse errors.
     private static final Logger LOG = LoggerFactory.getLogger(ParseEventFn.class);
     private final Aggregator<Long, Long> numParseErrors =
-        createAggregator("ParseErrors", new Sum.SumLongFn());
+        createAggregator("ParseErrors", Sum.ofLongs());
 
     @ProcessElement
     public void processElement(ProcessContext c) {
@@ -160,7 +160,7 @@ public class UserScore {
     }
 
     @Override
-    public PCollection<KV<String, Integer>> apply(
+    public PCollection<KV<String, Integer>> expand(
         PCollection<GameActionInfo> gameInfo) {
 
       return gameInfo
@@ -177,7 +177,7 @@ public class UserScore {
   /**
    * Options supported by {@link UserScore}.
    */
-  public static interface Options extends PipelineOptions {
+  public interface Options extends PipelineOptions {
 
     @Description("Path to the data file(s) containing game data.")
     // The default maps to two large Google Cloud Storage files (each ~12GB) holding two subsequent
@@ -193,8 +193,8 @@ public class UserScore {
 
     @Description("The BigQuery table name. Should not already exist.")
     @Default.String("user_score")
-    String getTableName();
-    void setTableName(String value);
+    String getUserScoreTableName();
+    void setUserScoreTableName(String value);
   }
 
   /**
@@ -202,13 +202,17 @@ public class UserScore {
    * is passed to the {@link WriteToBigQuery} constructor to write user score sums.
    */
   protected static Map<String, WriteToBigQuery.FieldInfo<KV<String, Integer>>>
-    configureBigQueryWrite() {
+      configureBigQueryWrite() {
     Map<String, WriteToBigQuery.FieldInfo<KV<String, Integer>>> tableConfigure =
         new HashMap<String, WriteToBigQuery.FieldInfo<KV<String, Integer>>>();
-    tableConfigure.put("user",
-        new WriteToBigQuery.FieldInfo<KV<String, Integer>>("STRING", c -> c.element().getKey()));
-    tableConfigure.put("total_score",
-        new WriteToBigQuery.FieldInfo<KV<String, Integer>>("INTEGER", c -> c.element().getValue()));
+    tableConfigure.put(
+        "user",
+        new WriteToBigQuery.FieldInfo<KV<String, Integer>>(
+            "STRING", (c, w) -> c.element().getKey()));
+    tableConfigure.put(
+        "total_score",
+        new WriteToBigQuery.FieldInfo<KV<String, Integer>>(
+            "INTEGER", (c, w) -> c.element().getValue()));
     return tableConfigure;
   }
 
@@ -228,11 +232,11 @@ public class UserScore {
       // Extract and sum username/score pairs from the event data.
       .apply("ExtractUserScore", new ExtractAndSumScore("user"))
       .apply("WriteUserScoreSums",
-          new WriteToBigQuery<KV<String, Integer>>(options.getTableName(),
+          new WriteToBigQuery<KV<String, Integer>>(options.getUserScoreTableName(),
                                                    configureBigQueryWrite()));
 
     // Run the batch pipeline.
-    pipeline.run();
+    pipeline.run().waitUntilFinish();
   }
   // [END DocInclude_USMain]
 

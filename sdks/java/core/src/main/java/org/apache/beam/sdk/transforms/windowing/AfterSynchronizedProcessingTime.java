@@ -18,24 +18,26 @@
 package org.apache.beam.sdk.transforms.windowing;
 
 import com.google.common.base.Objects;
-import java.util.Collections;
 import java.util.List;
-import javax.annotation.Nullable;
-import org.apache.beam.sdk.transforms.SerializableFunction;
-import org.apache.beam.sdk.util.TimeDomain;
+import org.apache.beam.sdk.transforms.windowing.Trigger.OnceTrigger;
 import org.joda.time.Instant;
 
-class AfterSynchronizedProcessingTime extends AfterDelayFromFirstElement {
+/**
+ * <i><b>FOR INTERNAL USE ONLY</b></i>. A trigger that fires after synchronized processing time has
+ * reached the processing time of the first element's arrival.
+ *
+ * <p>This is for internal, primarily as a "continuation trigger" for {@link AfterProcessingTime}
+ * triggers. In that use, this trigger is ready as soon as all upstream workers processing time
+ * clocks have caught up to the moment that input arrived.
+ */
+public class AfterSynchronizedProcessingTime extends OnceTrigger {
 
-  @Override
-  @Nullable
-  public Instant getCurrentTime(Trigger.TriggerContext context) {
-    return context.currentSynchronizedProcessingTime();
+  public static AfterSynchronizedProcessingTime ofFirstElement() {
+    return new AfterSynchronizedProcessingTime();
   }
 
-  public AfterSynchronizedProcessingTime() {
-    super(TimeDomain.SYNCHRONIZED_PROCESSING_TIME,
-        Collections.<SerializableFunction<Instant, Instant>>emptyList());
+  private AfterSynchronizedProcessingTime() {
+    super(null);
   }
 
   @Override
@@ -62,12 +64,4 @@ class AfterSynchronizedProcessingTime extends AfterDelayFromFirstElement {
   public int hashCode() {
     return Objects.hashCode(AfterSynchronizedProcessingTime.class);
   }
-
-  @Override
-  protected AfterSynchronizedProcessingTime
-      newWith(List<SerializableFunction<Instant, Instant>> transforms) {
-    // ignore transforms
-    return this;
-  }
-
 }

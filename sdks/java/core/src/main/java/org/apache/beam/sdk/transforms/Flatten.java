@@ -64,8 +64,8 @@ public class Flatten {
    * @param <T> the type of the elements in the input and output
    * {@code PCollection}s.
    */
-  public static <T> FlattenPCollectionList<T> pCollections() {
-    return new FlattenPCollectionList<>();
+  public static <T> PCollections<T> pCollections() {
+    return new PCollections<>();
   }
 
   /**
@@ -86,8 +86,8 @@ public class Flatten {
    * @param <T> the type of the elements of the input {@code Iterable} and
    * the output {@code PCollection}
    */
-  public static <T> FlattenIterables<T> iterables() {
-    return new FlattenIterables<>();
+  public static <T> Iterables<T> iterables() {
+    return new Iterables<>();
   }
 
   /**
@@ -99,13 +99,13 @@ public class Flatten {
    * @param <T> the type of the elements in the input and output
    * {@code PCollection}s.
    */
-  public static class FlattenPCollectionList<T>
+  public static class PCollections<T>
       extends PTransform<PCollectionList<T>, PCollection<T>> {
 
-    private FlattenPCollectionList() { }
+    private PCollections() { }
 
     @Override
-    public PCollection<T> apply(PCollectionList<T> inputs) {
+    public PCollection<T> expand(PCollectionList<T> inputs) {
       WindowingStrategy<?, ?> windowingStrategy;
       IsBounded isBounded = IsBounded.BOUNDED;
       if (!inputs.getAll().isEmpty()) {
@@ -118,8 +118,7 @@ public class Flatten {
                 + windowingStrategy.getWindowFn() + ", " + other.getWindowFn());
           }
 
-          if (!windowingStrategy.getTrigger().getSpec()
-              .isCompatible(other.getTrigger().getSpec())) {
+          if (!windowingStrategy.getTrigger().isCompatible(other.getTrigger())) {
             throw new IllegalStateException(
                 "Inputs to Flatten had incompatible triggers: "
                 + windowingStrategy.getTrigger() + ", " + other.getTrigger());
@@ -160,11 +159,12 @@ public class Flatten {
    * @param <T> the type of the elements of the input {@code Iterable}s and
    * the output {@code PCollection}
    */
-  public static class FlattenIterables<T>
+  public static class Iterables<T>
       extends PTransform<PCollection<? extends Iterable<T>>, PCollection<T>> {
+    private Iterables() {}
 
     @Override
-    public PCollection<T> apply(PCollection<? extends Iterable<T>> in) {
+    public PCollection<T> expand(PCollection<? extends Iterable<T>> in) {
       Coder<? extends Iterable<T>> inCoder = in.getCoder();
       if (!(inCoder instanceof IterableLikeCoder)) {
         throw new IllegalArgumentException(

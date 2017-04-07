@@ -20,7 +20,6 @@ package org.apache.beam.runners.dataflow.util;
 import static org.apache.beam.runners.dataflow.util.TimeUtil.fromCloudTime;
 
 import com.google.api.services.dataflow.Dataflow;
-import com.google.api.services.dataflow.Dataflow.Projects.Jobs.Messages;
 import com.google.api.services.dataflow.model.JobMessage;
 import com.google.api.services.dataflow.model.ListJobMessagesResponse;
 import com.google.common.base.MoreObjects;
@@ -35,6 +34,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import javax.annotation.Nullable;
+import org.apache.beam.runners.dataflow.DataflowClient;
 import org.apache.beam.runners.dataflow.options.DataflowPipelineOptions;
 import org.apache.beam.sdk.PipelineResult.State;
 import org.joda.time.Instant;
@@ -46,7 +46,7 @@ import org.slf4j.LoggerFactory;
  */
 public final class MonitoringUtil {
 
-  private static final String GCLOUD_DATAFLOW_PREFIX = "gcloud alpha dataflow";
+  private static final String GCLOUD_DATAFLOW_PREFIX = "gcloud beta dataflow";
   private static final String ENDPOINT_OVERRIDE_ENV_VAR =
       "CLOUDSDK_API_ENDPOINT_OVERRIDES_DATAFLOW";
 
@@ -67,8 +67,7 @@ public final class MonitoringUtil {
   private static final String JOB_MESSAGE_DETAILED = "JOB_MESSAGE_DETAILED";
   private static final String JOB_MESSAGE_DEBUG = "JOB_MESSAGE_DEBUG";
 
-  private String projectId;
-  private Messages messagesClient;
+  private final DataflowClient dataflowClient;
 
   /**
    * An interface that can be used for defining callbacks to receive a list
@@ -115,14 +114,8 @@ public final class MonitoringUtil {
   }
 
   /** Construct a helper for monitoring. */
-  public MonitoringUtil(String projectId, Dataflow dataflow) {
-    this(projectId, dataflow.projects().jobs().messages());
-  }
-
-  // @VisibleForTesting
-  MonitoringUtil(String projectId, Messages messagesClient) {
-    this.projectId = projectId;
-    this.messagesClient = messagesClient;
+  public MonitoringUtil(DataflowClient dataflowClient) {
+    this.dataflowClient = dataflowClient;
   }
 
   /**
@@ -149,7 +142,6 @@ public final class MonitoringUtil {
    * @param startTimestampMs Return only those messages with a
    *   timestamp greater than this value.
    * @return collection of messages
-   * @throws IOException
    */
   public ArrayList<JobMessage> getJobMessages(
       String jobId, long startTimestampMs) throws IOException {
@@ -158,12 +150,7 @@ public final class MonitoringUtil {
     ArrayList<JobMessage> allMessages = new ArrayList<>();
     String pageToken = null;
     while (true) {
-      Messages.List listRequest = messagesClient.list(projectId, jobId);
-      if (pageToken != null) {
-        listRequest.setPageToken(pageToken);
-      }
-      ListJobMessagesResponse response = listRequest.execute();
-
+      ListJobMessagesResponse response = dataflowClient.listJobMessages(jobId, pageToken);
       if (response == null || response.getJobMessages() == null) {
         return allMessages;
       }

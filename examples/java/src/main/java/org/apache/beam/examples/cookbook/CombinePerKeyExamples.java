@@ -80,7 +80,7 @@ public class CombinePerKeyExamples {
    */
   static class ExtractLargeWordsFn extends DoFn<TableRow, KV<String, String>> {
     private final Aggregator<Long, Long> smallerWords =
-        createAggregator("smallerWords", new Sum.SumLongFn());
+        createAggregator("smallerWords", Sum.ofLongs());
 
     @ProcessElement
     public void processElement(ProcessContext c){
@@ -125,7 +125,7 @@ public class CombinePerKeyExamples {
   static class PlaysForWord
       extends PTransform<PCollection<TableRow>, PCollection<TableRow>> {
     @Override
-    public PCollection<TableRow> apply(PCollection<TableRow> rows) {
+    public PCollection<TableRow> expand(PCollection<TableRow> rows) {
 
       // row... => <word, play_name> ...
       PCollection<KV<String, String>> words = rows.apply(
@@ -173,7 +173,7 @@ public class CombinePerKeyExamples {
    *
    * <p>Inherits standard configuration options.
    */
-  private static interface Options extends PipelineOptions {
+  private interface Options extends PipelineOptions {
     @Description("Table to read from, specified as "
         + "<project_id>:<dataset_id>.<table_id>")
     @Default.String(SHAKESPEARE_TABLE)
@@ -208,6 +208,6 @@ public class CombinePerKeyExamples {
         .withCreateDisposition(BigQueryIO.Write.CreateDisposition.CREATE_IF_NEEDED)
         .withWriteDisposition(BigQueryIO.Write.WriteDisposition.WRITE_TRUNCATE));
 
-    p.run();
+    p.run().waitUntilFinish();
   }
 }

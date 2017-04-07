@@ -17,11 +17,12 @@
  */
 package org.apache.beam.runners.direct;
 
+import com.google.common.collect.Iterables;
 import org.apache.beam.runners.direct.DirectRunner.CommittedBundle;
 import org.apache.beam.runners.direct.DirectRunner.UncommittedBundle;
 import org.apache.beam.sdk.transforms.AppliedPTransform;
 import org.apache.beam.sdk.transforms.Flatten;
-import org.apache.beam.sdk.transforms.Flatten.FlattenPCollectionList;
+import org.apache.beam.sdk.transforms.Flatten.PCollections;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.util.WindowedValue;
 import org.apache.beam.sdk.values.PCollection;
@@ -40,12 +41,10 @@ class FlattenEvaluatorFactory implements TransformEvaluatorFactory {
 
   @Override
   public <InputT> TransformEvaluator<InputT> forApplication(
-      AppliedPTransform<?, ?, ?> application,
-      CommittedBundle<?> inputBundle
-      ) {
+      AppliedPTransform<?, ?, ?> application, CommittedBundle<?> inputBundle) {
     @SuppressWarnings({"cast", "unchecked", "rawtypes"})
-    TransformEvaluator<InputT> evaluator = (TransformEvaluator<InputT>) createInMemoryEvaluator(
-            (AppliedPTransform) application, inputBundle);
+    TransformEvaluator<InputT> evaluator =
+        (TransformEvaluator<InputT>) createInMemoryEvaluator((AppliedPTransform) application);
     return evaluator;
   }
 
@@ -54,28 +53,22 @@ class FlattenEvaluatorFactory implements TransformEvaluatorFactory {
 
   private <InputT> TransformEvaluator<InputT> createInMemoryEvaluator(
       final AppliedPTransform<
-              PCollectionList<InputT>, PCollection<InputT>, FlattenPCollectionList<InputT>>
-          application,
-      final CommittedBundle<InputT> inputBundle) {
-    if (inputBundle == null) {
-      // it is impossible to call processElement on a flatten with no input bundle. A Flatten with
-      // no input bundle occurs as an output of Flatten.pcollections(PCollectionList.empty())
-      return new FlattenEvaluator<>(
-          null, StepTransformResult.withoutHold(application).build());
-    }
+              PCollectionList<InputT>, PCollection<InputT>, PCollections<InputT>>
+          application) {
     final UncommittedBundle<InputT> outputBundle =
-        evaluationContext.createBundle(application.getOutput());
-    final TransformResult result =
-        StepTransformResult.withoutHold(application).addOutput(outputBundle).build();
+        evaluationContext.createBundle(
+            (PCollection<InputT>) Iterables.getOnlyElement(application.getOutputs()).getValue());
+    final TransformResult<InputT> result =
+        StepTransformResult.<InputT>withoutHold(application).addOutput(outputBundle).build();
     return new FlattenEvaluator<>(outputBundle, result);
   }
 
   private static class FlattenEvaluator<InputT> implements TransformEvaluator<InputT> {
     private final UncommittedBundle<InputT> outputBundle;
-    private final TransformResult result;
+    private final TransformResult<InputT> result;
 
     public FlattenEvaluator(
-        UncommittedBundle<InputT> outputBundle, TransformResult result) {
+        UncommittedBundle<InputT> outputBundle, TransformResult<InputT> result) {
       this.outputBundle = outputBundle;
       this.result = result;
     }
@@ -86,7 +79,7 @@ class FlattenEvaluatorFactory implements TransformEvaluatorFactory {
     }
 
     @Override
-    public TransformResult finishBundle() {
+    public TransformResult<InputT> finishBundle() {
       return result;
     }
   }

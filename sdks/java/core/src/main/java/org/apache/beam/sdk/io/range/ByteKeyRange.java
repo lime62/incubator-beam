@@ -62,14 +62,14 @@ import org.slf4j.LoggerFactory;
  * <p>Key interpolation, fraction estimation, and range splitting are all interpreted in these
  * floating-point semantics. See the respective implementations for further details. <b>Note:</b>
  * the underlying implementations of these functions use {@link BigInteger} and {@link BigDecimal},
- * so they can be slow and should not be called in hot loops. Dataflow's dynamic work
- * rebalancing will only invoke these functions during periodic control operations, so they are not
- * called on the critical path.
+ * so they can be slow and should not be called in hot loops. Dynamic work rebalancing will only
+ * invoke these functions during periodic control operations, so they are not called on the critical
+ * path.
  *
  * @see ByteKey
  */
 public final class ByteKeyRange implements Serializable {
-  private static final Logger logger = LoggerFactory.getLogger(ByteKeyRange.class);
+  private static final Logger LOG = LoggerFactory.getLogger(ByteKeyRange.class);
 
   /** The range of all keys, with empty start and end keys. */
   public static final ByteKeyRange ALL_KEYS = ByteKeyRange.of(ByteKey.EMPTY, ByteKey.EMPTY);
@@ -133,7 +133,7 @@ public final class ByteKeyRange implements Serializable {
    * Specifically, if this range is unsplittable (e.g., because the start and end keys are equal
    * up to padding by zero bytes), the list returned will only contain the start and end key.
    *
-   * @throws IllegalArgumentException if the specified number of splits is < 1
+   * @throws IllegalArgumentException if the specified number of splits is less than 1
    * @see ByteKeyRange the ByteKeyRange class Javadoc for more information about split semantics.
    */
   public List<ByteKey> split(int numSplits) {
@@ -191,7 +191,7 @@ public final class ByteKeyRange implements Serializable {
     // Keys are equal subject to padding by 0.
     BigInteger range = rangeEndInt.subtract(rangeStartInt);
     if (range.equals(BigInteger.ZERO)) {
-      logger.warn(
+      LOG.warn(
           "Using 0.0 as the default fraction for this near-empty range {} where start and end keys"
               + " differ only by trailing zeros.",
           this);

@@ -63,7 +63,7 @@ import org.apache.beam.sdk.values.PCollection.IsBounded;
  * {@code Coder} of the values of the input.
  *
  * <p>Example of use:
- * <pre><code>
+ * <pre>{@code
  * PCollection<KV<String, Doc>> urlDocPairs = ...;
  * PCollection<KV<String, Iterable<Doc>>> urlToDocs =
  *     urlDocPairs.apply(GroupByKey.<String, Doc>create());
@@ -75,7 +75,7 @@ import org.apache.beam.sdk.values.PCollection.IsBounded;
  *         Iterable<Doc> docsWithThatUrl = c.element().getValue();
  *         ... process all docs having that url ...
  *       }}));
- * </code></pre>
+ * }</pre>
  *
  * <p>{@code GroupByKey} is a key primitive in data-parallel
  * processing, since it is the main way to efficiently bring
@@ -102,7 +102,7 @@ import org.apache.beam.sdk.values.PCollection.IsBounded;
  * as the input.
  *
  * <p>If the input {@code PCollection} contains late data (see
- * {@link org.apache.beam.sdk.io.PubsubIO.Read.Bound#timestampLabel}
+ * {@link org.apache.beam.sdk.io.PubsubIO.Read#timestampLabel}
  * for an example of how this can occur) or the
  * {@link Window#triggering requested TriggerFn} can fire before
  * the watermark, then there may be multiple elements
@@ -142,17 +142,17 @@ public class GroupByKey<K, V>
   }
 
   /**
-   * Returns a {@code GroupByKey<K, V>} {@code PTransform}.
+   * Returns a {@code GroupByKey<K, V>} {@code PTransform} that assumes it will be grouping
+   * a small number of keys.
    *
    * @param <K> the type of the keys of the input and output
    * {@code PCollection}s
    * @param <V> the type of the values of the input {@code PCollection}
    * and the elements of the {@code Iterable}s in the output
    * {@code PCollection}
-   * @param fewKeys whether it groups just few keys.
    */
-  static <K, V> GroupByKey<K, V> create(boolean fewKeys) {
-    return new GroupByKey<>(fewKeys);
+  static <K, V> GroupByKey<K, V> createWithFewKeys() {
+    return new GroupByKey<>(true);
   }
 
   /**
@@ -169,7 +169,7 @@ public class GroupByKey<K, V>
     // Verify that the input PCollection is bounded, or that there is windowing/triggering being
     // used. Without this, the watermark (at end of global window) will never be reached.
     if (windowingStrategy.getWindowFn() instanceof GlobalWindows
-        && windowingStrategy.getTrigger().getSpec() instanceof DefaultTrigger
+        && windowingStrategy.getTrigger() instanceof DefaultTrigger
         && input.isBounded() != IsBounded.BOUNDED) {
       throw new IllegalStateException("GroupByKey cannot be applied to non-bounded PCollection in "
           + "the GlobalWindow without a trigger. Use a Window.into or Window.triggering transform "
@@ -212,11 +212,11 @@ public class GroupByKey<K, V>
     // We also switch to the continuation trigger associated with the current trigger.
     return inputStrategy
         .withWindowFn(inputWindowFn)
-        .withTrigger(inputStrategy.getTrigger().getSpec().getContinuationTrigger());
+        .withTrigger(inputStrategy.getTrigger().getContinuationTrigger());
   }
 
   @Override
-  public PCollection<KV<K, Iterable<V>>> apply(PCollection<KV<K, V>> input) {
+  public PCollection<KV<K, Iterable<V>>> expand(PCollection<KV<K, V>> input) {
     // This primitive operation groups by the combination of key and window,
     // merging windows as needed, using the windows assigned to the
     // key/value input elements and the window merge operation of the
