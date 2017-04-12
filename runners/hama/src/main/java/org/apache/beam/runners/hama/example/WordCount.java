@@ -4,6 +4,7 @@ import org.apache.beam.runners.hama.HamaPipelineOptions;
 import org.apache.beam.runners.hama.HamaRunner;
 import org.apache.beam.runners.hama.coders.WritableCoder;
 import org.apache.beam.runners.hama.translation.io.HadoopIO;
+import org.apache.beam.runners.hama.translation.io.KVWritable;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.coders.KvCoder;
 import org.apache.beam.sdk.io.TextIO;
@@ -109,16 +110,20 @@ public class WordCount {
             Text.class,
             LongWritable.class);
 
-    PCollection<KV<Text, LongWritable>> input = p.apply(read)
-        .setCoder(KvCoder.of(WritableCoder.of(Text.class), WritableCoder.of(LongWritable.class)));
+    PCollection<KVWritable<Text, LongWritable>> input = p.apply(read);
+        /*.setCoder(KvCoder.of(WritableCoder.of(Text.class), WritableCoder.of(LongWritable.class)));*/
 
     // just simple test to check if superstep in dofn can get data from previous superstep
-    PCollection<KV<Text, LongWritable>> output = input.apply("test", ParDo.of(new DoFn<KV<Text, LongWritable>, KV<Text, LongWritable>>() {
+    PCollection<KVWritable<Text, LongWritable>> output = input.apply("test", ParDo.of(new DoFn<KVWritable<Text, LongWritable>, KVWritable<Text, LongWritable>>() {
       @ProcessElement
       public void processElement(ProcessContext c) {
-        for (String word : c.element().toString().split("[^a-zA-Z']+")) {
+        System.out.println("yes!!!!!!!!!!!!!!!!!11");
+
+        //System.out.println(c.element());
+        for (String word : c.element().getKey().toString().split("[^a-zA-Z']+")) {
           if (!word.isEmpty()) {
-            c.output(KV.of(new Text(word), new LongWritable(11)));
+            System.out.println(word + " " + 1);
+//            c.output(KV.of(new Text(word), new LongWritable(11)));
           }
         }
       }

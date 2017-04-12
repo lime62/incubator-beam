@@ -17,21 +17,21 @@ import org.apache.hadoop.io.Text;
 import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.io.WritableComparable;
 import org.apache.hama.bsp.BSPPeer;
-import org.apache.hama.bsp.Superstep;
+import org.apache.hama.bsp.DataflowSuperstep;
 import org.apache.hama.util.ReflectionUtils;
 import org.joda.time.Instant;
 
 import java.io.IOException;
 
-public class DoFnFunction extends Superstep<WritableComparable<?>, Writable, WritableComparable<?>, Writable, KVWritable> {
+public class DoFnFunction extends DataflowSuperstep<WritableComparable<?>, Writable, WritableComparable<?>, Writable, KVWritable> {
 
 //  private final OldDoFn<KV, KV> fn;
-  private OldDoFn<KV, KV> fn;
+  private OldDoFn<KVWritable, KVWritable> fn;
 
   public DoFnFunction() {
   }
 
-  public DoFnFunction(OldDoFn<KV, KV> fn) {
+  public DoFnFunction(OldDoFn<KVWritable, KVWritable> fn) {
     this.fn = fn;
   }
 
@@ -43,30 +43,32 @@ public class DoFnFunction extends Superstep<WritableComparable<?>, Writable, Wri
     // todo : just for testing
     KVWritable<Text, LongWritable> received;
     int i = 0;
+    ProcCtxt ctxt = new ProcCtxt(fn);
     while ((received = (KVWritable<Text, LongWritable>) peer.getCurrentMessage()) != null) {
-      System.out.println((i++) + " : " + received.getValue() + "-" + received.getKey());
-
+      //System.out.println((i++) + " : " + received.getValue() + "-" + received.getKey());
+      ctxt.element = received;
+      try {
+//        fn.startBundle(ctxt);
+        fn.processElement(ctxt);
+//        fn.finishBundle(ctxt);
+      } catch (Exception e) {
+        e.printStackTrace();
+      }
     }
-//    ProcCtxt ctxt = new ProcCtxt(fn);
-//    try {
-//      fn.startBundle(ctxt);
-//      fn.processElement(ctxt);
-//      fn.finishBundle(ctxt);
-//    } catch (Exception e) {
-//      e.printStackTrace();
-//    }
+
+
   }
 
-  private class ProcCtxt extends OldDoFn<KV, KV>.ProcessContext {
+  private class ProcCtxt extends OldDoFn<KVWritable, KVWritable>.ProcessContext {
 
-    public ProcCtxt(OldDoFn<KV, KV> fn) {
+    public ProcCtxt(OldDoFn<KVWritable, KVWritable> fn) {
       fn.super();
     }
-
+    private KVWritable element;
 
     @Override
-    public KV element() {
-      return null;
+    public KVWritable element() {
+      return element;
     }
 
     @Override
@@ -90,7 +92,7 @@ public class DoFnFunction extends Superstep<WritableComparable<?>, Writable, Wri
     }
 
     @Override
-    public WindowingInternals<KV, KV> windowingInternals() {
+    public WindowingInternals<KVWritable, KVWritable> windowingInternals() {
       return null;
     }
 
@@ -100,12 +102,12 @@ public class DoFnFunction extends Superstep<WritableComparable<?>, Writable, Wri
     }
 
     @Override
-    public void output(KV output) {
+    public void output(KVWritable output) {
 
     }
 
     @Override
-    public void outputWithTimestamp(KV output, Instant timestamp) {
+    public void outputWithTimestamp(KVWritable output, Instant timestamp) {
 
     }
 

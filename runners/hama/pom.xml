@@ -14,7 +14,7 @@
   <packaging>jar</packaging>
 
   <properties>
-    <hama.version>0.7.0</hama.version>
+    <hama.version>0.7.2-SNAPSHOT</hama.version>
     <hadoop.version>2.2.0</hadoop.version>
   </properties>
 
@@ -30,6 +30,20 @@
       <artifactId>hama-commons</artifactId>
       <version>${hama.version}</version>
     </dependency>
+    <!--<dependency>
+      <groupId>org.apache.hama</groupId>
+      <artifactId>hama-core</artifactId>
+      <version>${hama.version}</version>
+      <scope>system</scope>
+      <systemPath>/home/jlim235/project/hama/dist/target/hama-0.7.2-SNAPSHOT/hama-0.7.2-SNAPSHOT/hama-core-0.7.2-SNAPSHOT.jar</systemPath>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hama</groupId>
+      <artifactId>hama-commons</artifactId>
+      <version>${hama.version}</version>
+      <scope>system</scope>
+      <systemPath>/home/jlim235/project/hama/dist/target/hama-0.7.2-SNAPSHOT/hama-0.7.2-SNAPSHOT/hama-commons-0.7.2-SNAPSHOT.jar</systemPath>
+    </dependency>-->
 
     <!-- Beam -->
     <dependency>

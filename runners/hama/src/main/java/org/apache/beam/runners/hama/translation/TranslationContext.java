@@ -26,7 +26,7 @@ public class TranslationContext implements HamaRunnerResult {
   private final HamaPipelineOptions pipelineOptions;
   private HamaConfiguration conf;
   private BSPJob bsp;
-  private List<Class<? extends Superstep>> supersteps;
+  private List<DataflowSuperstep> supersteps;
   private InputFormat inputFormat;
   private OutputFormat outputFormat;
 
@@ -56,12 +56,13 @@ public class TranslationContext implements HamaRunnerResult {
     this.inputPath = inputPath;
   }
 
-  public void addSuperstep(Class<? extends Superstep> superstep) {
+  public void addSuperstep(DataflowSuperstep superstep) {
     supersteps.add(superstep);
   }
 
   public void computeOutputs() throws InterruptedException, IOException, ClassNotFoundException {
-    bsp.setSupersteps(supersteps.toArray(new Class[supersteps.size()]));
+    //bsp.setSupersteps(supersteps.toArray(new Class[supersteps.size()]));
+    bsp.setDataflowSupersteps(supersteps);
     bsp.setNumBspTask(5);
     bsp.setOutputPath(TMP_OUTPUT);
 //    bsp.setPartitioner(SimpleHashPartitioner.class);

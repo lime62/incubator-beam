@@ -19,6 +19,7 @@ import org.apache.hadoop.io.Text;
 import org.apache.hadoop.yarn.webapp.hamlet.HamletSpec;
 import org.apache.hama.bsp.BSPJob;
 import org.apache.hama.bsp.BSPPeer;
+import org.apache.hama.bsp.DataflowSuperstep;
 import org.apache.hama.bsp.Superstep;
 import org.apache.hama.util.ReflectionUtils;
 
@@ -65,7 +66,7 @@ public class HamaPipelineTranslator extends Pipeline.PipelineVisitor.Defaults {
 
   // todo : just for testing
   // extends superstepbsp and add this kind of code
-  public static class TestSuperStep extends Superstep {
+  public static class TestSuperStep extends DataflowSuperstep {
 
     @Override
     protected void compute(BSPPeer peer) throws IOException {
@@ -87,9 +88,9 @@ public class HamaPipelineTranslator extends Pipeline.PipelineVisitor.Defaults {
     return new TransformTranslator<ParDo.Bound<InputT, OutputT>>() {
       @Override
       public void translate(final ParDo.Bound<InputT, OutputT> transform, TranslationContext context) {
-        context.addSuperstep(TestSuperStep.class);
-        DoFnFunction dofn = new DoFnFunction((OldDoFn<KV, KV>) transform.getFn());
-        context.addSuperstep(dofn.getClass());
+        context.addSuperstep(new TestSuperStep());
+        DoFnFunction dofn = new DoFnFunction((OldDoFn<KVWritable, KVWritable>) transform.getFn());
+        context.addSuperstep(dofn);
       }
     };
   }
